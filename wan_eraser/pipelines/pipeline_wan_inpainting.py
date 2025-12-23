@@ -488,6 +488,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         latents: Optional[torch.Tensor] = None,
         cond_latents: Optional[torch.Tensor] = None,
         cond_masks: Optional[torch.Tensor] = None,
+        ref_latents: Optional[torch.Tensor] = None,
+        mask_img_latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "np",
@@ -498,7 +500,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        if_v2v=True,
+        if_v2v=False,
         strength=1.0,
     ):
         r"""
@@ -629,16 +631,9 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
-        # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, shift=7) # orig=5.0
         timesteps = self.scheduler.timesteps
 
-        # 5. Prepare latent variables
-        #num_channels_latents = (
-        #    self.transformer.config.in_channels
-        #    if self.transformer is not None
-        #    else self.transformer_2.config.in_channels
-        #)
         num_channels_latents = self.vae.config.z_dim
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
@@ -656,7 +651,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             timesteps, num_inference_steps = self.scheduler.get_timesteps(
                 num_inference_steps, timesteps, strength
             )
-            
+    
             latent_timestep = timesteps[:1].to(device)
             latents = self.scheduler.add_noise(cond_latents, latents, latent_timestep)
             latents = latents.to(device)
@@ -679,31 +674,43 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 current_guidance_scale = guidance_scale
 
 
-                #latent_model_input = latents.to(transformer_dtype)
-                latent_model_input = torch.cat(
-                    [latents, cond_latents, cond_masks], dim=1
-                ).to(transformer_dtype)
-
+                # Three-branch temporal + channel fusion (matching training)
+                branch1 = torch.cat([latents, cond_latents, ref_latents], dim=2)
+                zeros_4ch = torch.zeros_like(cond_masks)
+                branch2 = torch.cat([zeros_4ch, cond_masks, mask_img_latents], dim=2)
+                zeros_16ch = torch.zeros_like(latents)
+                branch3 = torch.cat([zeros_16ch, cond_latents, ref_latents], dim=2)
+                
+                # [B, 48, 2F+1, H, W] + [B, 4, 2F+1, H, W] + [B, 48, 2F+1, H, W] -> [B, 100, 43, H, W]
+                latent_model_input = torch.cat([branch1, branch2, branch3], dim=1).to(transformer_dtype)
+                
                 timestep = t.expand(latents.shape[0])
 
+                num_latent_frames = latents.shape[2]  # F
+                
                 with current_model.cache_context("cond"):
-                    noise_pred = current_model(
+                    noise_pred_full = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
                         encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
+                    # Extract only the first F frames (corresponding to noisy_gt prediction)
+                    # noise_pred_full: [B, 16, 2F+1, H, W] -> noise_pred: [B, 16, F, H, W]
+                    noise_pred = noise_pred_full[:, :, :num_latent_frames, :, :]
 
                 if self.do_classifier_free_guidance:
                     with current_model.cache_context("uncond"):
-                        noise_uncond = current_model(
+                        noise_uncond_full = current_model(
                             hidden_states=latent_model_input,
                             timestep=timestep,
                             encoder_hidden_states=negative_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                         )[0]
+                        # Extract only the first F frames
+                        noise_uncond = noise_uncond_full[:, :, :num_latent_frames, :, :]
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1

@@ -31,7 +31,9 @@ from decord import VideoReader
 from torch.utils.data import Dataset
 from torchvision import transforms
 from moviepy import ImageSequenceClip
-
+import sys
+sys.path.append("/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/utils")
+from saber_mask import generate_mask, random_affine_preserve_mask
 
 # ============================================================================
 # Mask Generation Functions (from mask_generator_and_augmentation.py)
@@ -108,113 +110,6 @@ def shrink_to(mask: np.ndarray, target_area: int) -> np.ndarray:
     return mask
 
 
-def generate_mask(
-    h: int,
-    w: int,
-    area_ratio_range: Tuple[float, float] = (0.1, 0.5),
-    shape_types: Optional[List[str]] = None,
-    seed: Optional[int] = None,
-) -> np.ndarray:
-    """
-    Generate a binary mask with area in given ratio range.
-    
-    Args:
-        h, w: mask dimensions
-        area_ratio_range: (min_ratio, max_ratio) for mask area
-        shape_types: list of shape types to choose from
-        seed: random seed
-        
-    Returns:
-        mask: [H, W] uint8 array with values in {0, 1}
-    """
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-    
-    if shape_types is None:
-        shape_types = ["ellipse", "superellipse", "concave_polygon", "centered_rectangle"]
-    
-    shape_type = random.choice(shape_types)
-    total_pixels = h * w
-    A_lo = int(area_ratio_range[0] * total_pixels)
-    A_hi = int(area_ratio_range[1] * total_pixels)
-    target_area = random.randint(A_lo, A_hi)
-    
-    # Generate center position
-    cy = random.randint(h // 4, 3 * h // 4)
-    cx = random.randint(w // 4, 3 * w // 4)
-    
-    mask = np.zeros((h, w), dtype=np.uint8)
-    
-    if shape_type == "ellipse":
-        # Random ellipse
-        target_ratio = target_area / total_pixels
-        base_radius = np.sqrt(target_ratio * h * w / np.pi)
-        ry = int(base_radius * random.uniform(0.7, 1.3))
-        rx = int(base_radius * random.uniform(0.7, 1.3))
-        ry = max(10, min(ry, h // 2 - 10))
-        rx = max(10, min(rx, w // 2 - 10))
-        cv2.ellipse(mask, (cx, cy), (rx, ry), 0, 0, 360, 1, -1)
-        
-    elif shape_type == "superellipse":
-        # Superellipse (rounded rectangle)
-        target_ratio = target_area / total_pixels
-        base_size = np.sqrt(target_ratio * h * w)
-        ry = int(base_size * random.uniform(0.5, 1.0))
-        rx = int(base_size * random.uniform(0.5, 1.0))
-        ry = max(20, min(ry, h // 2 - 10))
-        rx = max(20, min(rx, w // 2 - 10))
-        n = random.uniform(2.5, 4.0)
-        
-        Y, X = np.ogrid[:h, :w]
-        Y = (Y - cy) / ry
-        X = (X - cx) / rx
-        inside = (np.abs(X) ** n + np.abs(Y) ** n) <= 1
-        mask[inside] = 1
-        
-    elif shape_type == "concave_polygon":
-        # Random polygon
-        num_vertices = random.randint(5, 8)
-        angles = np.sort(np.random.uniform(0, 2 * np.pi, num_vertices))
-        target_ratio = target_area / total_pixels
-        base_radius = np.sqrt(target_ratio * h * w / np.pi) * 1.2
-        
-        radii = base_radius * np.random.uniform(0.6, 1.0, num_vertices)
-        vertices = []
-        for angle, radius in zip(angles, radii):
-            vx = int(cx + radius * np.cos(angle))
-            vy = int(cy + radius * np.sin(angle))
-            vx = max(5, min(w - 5, vx))
-            vy = max(5, min(h - 5, vy))
-            vertices.append([vx, vy])
-        vertices = np.array(vertices, dtype=np.int32)
-        cv2.fillPoly(mask, [vertices], 1)
-        
-    elif shape_type == "centered_rectangle":
-        # Centered rectangle
-        target_ratio = target_area / total_pixels
-        base_size = np.sqrt(target_ratio * h * w)
-        rh = int(base_size * random.uniform(0.7, 1.3))
-        rw = int(base_size * random.uniform(0.7, 1.3))
-        rh = max(20, min(rh, h - 20))
-        rw = max(20, min(rw, w - 20))
-        
-        y1 = max(0, cy - rh // 2)
-        y2 = min(h, cy + rh // 2)
-        x1 = max(0, cx - rw // 2)
-        x2 = min(w, cx + rw // 2)
-        mask[y1:y2, x1:x2] = 1
-    
-    # Adjust area if needed
-    current_area = mask.sum()
-    if current_area < A_lo:
-        mask = grow_to(mask, A_lo)
-    elif current_area > A_hi:
-        mask = shrink_to(mask, A_hi)
-    
-    return mask
-
-
 # ============================================================================
 # Utility Functions
 # ============================================================================
@@ -222,7 +117,7 @@ def generate_mask(
 ASPECT_RATIO_960 = {
     '0.25': [480., 1920.], '0.26': [480., 1856.], '0.27': [480., 1792.], '0.28': [480., 1728.],
     '0.32': [544., 1728.], '0.33': [544., 1664.], '0.35': [544., 1600.], '0.4':  [608., 1536.],
-    '0.42':  [608., 1472.], '0.48': [672., 1408.], '0.5': [672., 1344.], '0.52': [672., 1280.],
+    '0.42':  [608., 1472.], '0.48': [480672., 1408.], '0.5': [672., 1344.], '0.52': [672., 1280.],
     '0.57': [736., 1280.], '0.6': [736., 1216.], '0.68': [800., 1152.], '0.72': [800., 1088.],
     '0.78': [864., 1088.], '0.82': [864.,  960.], '0.88': [928.,  960.], '0.94': [928.,  896.],
     '1.0':  [960.,  960.], '1.07': [960.,  896.], '1.13': [1024.,  896.], '1.21': [1024.,  832.],
@@ -285,12 +180,15 @@ def save_debug_outputs(
     masked_video: np.ndarray,
     mask: np.ndarray,
     ref_image: np.ndarray,
-    caption: str,
+    ref_masked_image: np.ndarray = None,
+    ref_image_aug: Optional[object] = None,
+    ref_mask_aug: Optional[object] = None,
+    caption: str = "",
     fps: float = 24,
 ):
     """
     Save generated training data for debugging/visualization.
-    
+
     Args:
         output_dir: directory to save outputs
         sample_idx: sample index
@@ -317,19 +215,103 @@ def save_debug_outputs(
     # Save mask image
     cv2.imwrite(str(sample_dir / "mask.png"), mask * 255)
     
-    # Save reference image
+    # Save reference image (foreground kept)
     cv2.imwrite(str(sample_dir / "ref_image.png"), cv2.cvtColor(ref_image, cv2.COLOR_RGB2BGR))
+    
+    # Save reference masked image (foreground removed)
+    if ref_masked_image is not None:
+        cv2.imwrite(str(sample_dir / "ref_masked_image.png"), cv2.cvtColor(ref_masked_image, cv2.COLOR_RGB2BGR))
+
+    if ref_image_aug is not None:
+        if torch.is_tensor(ref_image_aug):
+            x = ref_image_aug.detach().cpu().float()
+            x = x * 0.5 + 0.5
+            x = x.clamp(0, 1)
+            x = (x * 255.0).round().byte()
+            x = x.permute(1, 2, 0).contiguous().numpy()
+            if x.shape[2] == 1:
+                x = np.repeat(x, 3, axis=2)
+            cv2.imwrite(str(sample_dir / "ref_image_aug.png"), cv2.cvtColor(x, cv2.COLOR_RGB2BGR))
+
+    if ref_mask_aug is not None:
+        if torch.is_tensor(ref_mask_aug):
+            m = ref_mask_aug.detach().cpu().float()
+            if m.ndim == 3 and m.shape[0] == 1:
+                m = m[0]
+            m = ((m > 0.5).byte().numpy() * 255)
+            cv2.imwrite(str(sample_dir / "ref_mask_aug.png"), m)
     
     # Save caption
     with open(sample_dir / "caption.txt", "w") as f:
         f.write(caption)
     
-    print(f"Saved debug outputs to {sample_dir}")
+    # Return paths for CSV generation
+    return {
+        'sample_dir': str(sample_dir),
+        'mask_path': str(sample_dir / "mask.png"),
+        'ref_image_path': str(sample_dir / "ref_image.png"),
+        'caption': caption,
+    }
 
-
-# ============================================================================
-# Dataset Class
-# ============================================================================
+def augment_mask(
+    mask: np.ndarray,
+    rotation_range: Tuple[float, float] = (-10, 10),
+    scale_range: Tuple[float, float] = (0.8, 2.0),
+    flip_prob: float = 0.5,
+    shear_range: Tuple[float, float] = (-10, 10),
+) -> np.ndarray:
+    """
+    Apply random augmentation to mask.
+    
+    Args:
+        mask: [H, W] binary mask (uint8)
+        rotation_range: (min_deg, max_deg) rotation angle range
+        scale_range: (min_scale, max_scale) scale range
+        flip_prob: probability of horizontal flip
+        shear_range: (min_deg, max_deg) shear angle range
+    
+    Returns:
+        augmented mask: [H, W] uint8
+    """
+    h, w = mask.shape
+    center = (w / 2, h / 2)
+    
+    # Random parameters
+    angle = random.uniform(rotation_range[0], rotation_range[1])
+    scale = random.uniform(scale_range[0], scale_range[1])
+    shear_angle = random.uniform(shear_range[0], shear_range[1])
+    do_flip = random.random() < flip_prob
+    
+    # Horizontal flip
+    if do_flip:
+        mask = np.fliplr(mask).copy()
+    
+    # Build affine transformation matrix
+    # Rotation + Scale
+    M_rot = cv2.getRotationMatrix2D(center, angle, scale)
+    
+    # Apply shear
+    shear_rad = np.deg2rad(shear_angle)
+    shear_matrix = np.array([
+        [1, np.tan(shear_rad), 0],
+        [0, 1, 0]
+    ], dtype=np.float32)
+    
+    # Combine: first shear, then rotation+scale
+    M_rot_3x3 = np.vstack([M_rot, [0, 0, 1]])
+    shear_3x3 = np.vstack([shear_matrix, [0, 0, 1]])
+    combined = M_rot_3x3 @ shear_3x3
+    M_combined = combined[:2, :]
+    
+    # Apply transformation
+    augmented = cv2.warpAffine(
+        mask, M_combined, (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    
+    return augmented.astype(np.uint8)
 
 class InpaintingDataset(Dataset):
     """
@@ -498,26 +480,28 @@ class InpaintingDataset(Dataset):
         masked_video = torch.stack(masked_video_frames, dim=0)  # [F, C, H, W]
         mask_video = mask_tensor.unsqueeze(0).repeat(self.nframes, 1, 1, 1)  # [F, 1, H, W]
         
-        # Extract reference image (first frame foreground cropped by bbox)
+        # Extract reference image (first frame with mask==1 kept, same transform as mask)
         first_frame = video[0]
-        ref_crop, ref_mask_crop, bbox = crop_foreground_by_bbox(first_frame, mask, padding=10)
+        first_frame_fg = first_frame.copy()
+        first_frame_fg[mask < 0.5] = 0  # Keep only mask==1 region
+        first_frame_fg_pil = Image.fromarray(first_frame_fg)
+        ref_image = self._aug(first_frame_fg_pil, img_transform, state)  # [C, H, W]
         
-        # Resize ref image to match target size
-        ref_h, ref_w = closest_size
-        ref_crop_pil = Image.fromarray(ref_crop)
-        ref_transform = transforms.Compose([
-            transforms.Resize((ref_h, ref_w), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-        ref_image = ref_transform(ref_crop_pil)  # [C, H, W]
+        # Reference masked image is binary mask [1, H, W] (same as mask_image)
+        ref_masked_image = mask_tensor.clone()  # [1, H, W]
         
         # Mask image (first frame mask)
         mask_image = mask_video[0]  # [1, H, W]
 
-        # ============================================
-        # Save debug outputs if enabled
-        # ============================================
+        ref_image_aug, ref_masked_image_aug, _ = random_affine_preserve_mask(
+            ref_image,
+            ref_masked_image,
+            degrees=10.0,
+            scale_range=(0.8, 2.0),
+            hflip_prob=0.5,
+            shear_range=(-10.0, 10.0),
+        )
+
         if self.save_debug and random.random() < self.debug_save_prob:
             save_debug_outputs(
                 output_dir=self.debug_output_dir,
@@ -525,18 +509,261 @@ class InpaintingDataset(Dataset):
                 video=video,
                 masked_video=np.stack(masked_video_np, axis=0),
                 mask=mask,
-                ref_image=ref_crop,
+                ref_image=first_frame_fg,
+                ref_masked_image=None,
+                ref_image_aug=ref_image_aug,
+                ref_mask_aug=ref_masked_image_aug,
                 caption=vid_caption,
                 fps=fps,
             )
             self.debug_counter += 1
-
+        
         outputs = {
             'target_images': target_images,      # [F, C, H, W]
             'masked_video': masked_video,        # [F, C, H, W]
             'mask_video': mask_video,            # [F, 1, H, W]
             'mask_image': mask_image,            # [1, H, W]
-            'ref_image': ref_image,              # [C, H, W]
+            'ref_image': ref_image_aug,          # [C, H, W] - augmented
+            'ref_masked_image': ref_masked_image_aug, # [1, H, W] - binary mask, augmented
+            'caption': vid_caption,
+            'fps': fps,
+        }
+
+        return outputs
+
+
+class PreGeneratedInpaintingDataset(Dataset):
+    """
+    Dataset for video inpainting training with pre-generated masks and reference images.
+    
+    Reads pre-generated data from generate_training_data.py output:
+    - mask.png: static binary mask
+    - ref_image.png: first frame foreground (mask region kept)
+    
+    Input CSV format (from generate_training_data.py):
+        video_path: path to original video
+        mask_path: relative path to mask.png
+        ref_image_path: relative path to ref_image.png
+        caption: text prompt
+
+    Args:
+        args: config with csv_file_list, data_root, nframes, etc.
+        pregenerated_data_root: root directory for pre-generated data (mask/ref_image)
+        save_debug: whether to save debug outputs
+        debug_output_dir: directory for debug outputs
+        debug_save_prob: probability of saving each sample
+    """
+    
+    def __init__(
+        self,
+        args,
+        pregenerated_data_root: str = None,
+        save_debug: bool = False,
+        debug_output_dir: str = "./debug_outputs",
+        debug_save_prob: float = 0.01,
+    ):
+        self.args = args
+        self.repeat = 1
+        self.nframes = args.nframes
+        self.csv_file_list = args.csv_file_list
+        self.data_root = args.data_root
+        self.pregenerated_data_root = pregenerated_data_root or args.data_root
+
+        # Debug/visualization settings
+        self.save_debug = save_debug
+        self.debug_output_dir = debug_output_dir
+        self.debug_save_prob = debug_save_prob
+        self.debug_counter = 0
+        
+        self._load_metadata()
+        print(f'[PreGeneratedInpaintingDataset] len of metadata: {len(self.metadata)}')
+
+    def _load_metadata(self):
+        self.metadata = []
+        for csv_file in self.csv_file_list:
+            with open(csv_file, 'r', encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    self.metadata.append(row)
+
+    def __len__(self):
+        return len(self.metadata) * self.repeat
+
+    def _aug(self, frame, transform, state=None):
+        if state is not None:
+            torch.set_rng_state(state)
+        return transform(frame) if transform is not None else frame
+
+    def __getitem__(self, index):
+        while True:
+            index = index % len(self.metadata)
+            
+            # Read metadata
+            raw_data = self.metadata[index]
+            vid_path = os.path.join(self.data_root, raw_data.get('video_path', raw_data.get('vid_path', '')))
+            mask_path = os.path.join(self.pregenerated_data_root, raw_data.get('mask_path', ''))
+            ref_image_path = os.path.join(self.pregenerated_data_root, raw_data.get('ref_image_path', ''))
+            vid_caption = raw_data.get('caption', raw_data.get('prompt', ''))
+
+            try:
+                # Load video
+                video_reader = VideoReader(vid_path)
+                
+                # Handle short videos by repeating frames
+                if len(video_reader) < self.nframes:
+                    repeat_num = math.ceil(self.nframes / len(video_reader))
+                    if random.random() >= 0.5:
+                        temp_list = list(range(len(video_reader))) + list(range(len(video_reader)))[::-1][1:-1]
+                        all_frames = temp_list * repeat_num
+                    else:
+                        all_frames = list(range(len(video_reader))) + [len(video_reader) - 1] * (self.nframes - len(video_reader) + 3)
+                else:
+                    all_frames = list(range(len(video_reader)))
+
+                # Select random clip
+                rand_idx = random.randint(0, max(0, len(all_frames) - self.nframes - 1))
+                frame_indices = all_frames[rand_idx:rand_idx + self.nframes]
+                
+                if len(frame_indices) < self.nframes:
+                    print(f"vid frames are {len(frame_indices)}")
+                    index += 1
+                    continue
+                
+                video = video_reader.get_batch(frame_indices).asnumpy()  # [F, H, W, C]
+                fps = video_reader.get_avg_fps()
+                
+                # Load pre-generated mask
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    print(f"Failed to load mask: {mask_path}")
+                    index += 1
+                    continue
+                mask = (mask > 127).astype(np.uint8)  # Binarize
+                
+                # Load pre-generated reference image
+                ref_image_np = cv2.imread(ref_image_path)
+                if ref_image_np is None:
+                    print(f"Failed to load ref_image: {ref_image_path}")
+                    index += 1
+                    continue
+                ref_image_np = cv2.cvtColor(ref_image_np, cv2.COLOR_BGR2RGB)
+                
+                break
+                
+            except Exception as e:
+                print(f"Load data failed! video={vid_path}, error={e}")
+                index += 1
+                continue
+
+        assert video.shape[0] == self.nframes, f'{video.shape[0]}, self.nframes={self.nframes}'
+
+        height_v, width_v, _ = video[0].shape
+        ori_ratio = height_v / width_v
+
+        # Resize mask and ref_image to match video size if needed
+        if mask.shape[0] != height_v or mask.shape[1] != width_v:
+            mask = cv2.resize(mask, (width_v, height_v), interpolation=cv2.INTER_NEAREST)
+        if ref_image_np.shape[0] != height_v or ref_image_np.shape[1] != width_v:
+            ref_image_np = cv2.resize(ref_image_np, (width_v, height_v), interpolation=cv2.INTER_LINEAR)
+
+        # Compute target size
+        closest_size, closest_ratio = get_closest_ratio(height_v, width_v, ASPECT_RATIO_960)
+        closest_size = list(map(lambda x: int(x), closest_size))
+        
+        if closest_ratio > ori_ratio:
+            resize_size = height_v, int(height_v / closest_ratio)
+        else:
+            resize_size = int(width_v * closest_ratio), width_v
+
+        # Define transforms
+        img_transform = transforms.Compose([
+            transforms.RandomCrop(resize_size),
+            transforms.Resize(closest_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+
+        mask_transform = transforms.Compose([
+            transforms.RandomCrop(resize_size),
+            transforms.Resize(closest_size, interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor(),
+        ])
+
+        # Process frames with same random crop for all
+        target_images = []
+        masked_video_frames = []
+        masked_video_np = []  # For debug saving
+        
+        state = torch.get_rng_state()
+        
+        for t in range(self.nframes):
+            frame = video[t]
+            
+            # Target image (ground truth)
+            img = Image.fromarray(frame)
+            target_img = self._aug(img, img_transform, state)
+            target_images.append(target_img)
+            
+            # Masked video (mask==1 region blacked out)
+            masked_frame = frame.copy()
+            masked_frame[mask > 0.5] = 0  # Black out mask==1 region
+            masked_video_np.append(masked_frame)
+            masked_img = Image.fromarray(masked_frame)
+            masked_img = self._aug(masked_img, img_transform, state)
+            masked_video_frames.append(masked_img)
+
+        # Process mask (same for all frames)
+        mask_pil = Image.fromarray((mask * 255).astype(np.uint8)).convert("L")
+        mask_tensor = self._aug(mask_pil, mask_transform, state)
+        
+        # Stack tensors
+        target_images = torch.stack(target_images, dim=0)  # [F, C, H, W]
+        masked_video = torch.stack(masked_video_frames, dim=0)  # [F, C, H, W]
+        mask_video = mask_tensor.unsqueeze(0).repeat(self.nframes, 1, 1, 1)  # [F, 1, H, W]
+        
+        # Process pre-generated reference image
+        ref_image_pil = Image.fromarray(ref_image_np)
+        ref_image = self._aug(ref_image_pil, img_transform, state)  # [C, H, W]
+        
+        # Reference masked image is binary mask [1, H, W] (same as mask_image)
+        ref_masked_image = mask_tensor.clone()  # [1, H, W]
+        
+        # Mask image (first frame mask)
+        mask_image = mask_video[0]  # [1, H, W]
+
+        # Apply mask augmentation using random_affine_preserve_mask
+        ref_image_aug, ref_masked_image_aug, _ = random_affine_preserve_mask(
+            ref_image,
+            ref_masked_image,
+            degrees=10.0,
+            scale_range=(0.8, 2.0),
+            hflip_prob=0.5,
+            shear_range=(-10.0, 10.0),
+        )
+
+        if self.save_debug and random.random() < self.debug_save_prob:
+            save_debug_outputs(
+                output_dir=self.debug_output_dir,
+                sample_idx=self.debug_counter,
+                video=video,
+                masked_video=np.stack(masked_video_np, axis=0),
+                mask=mask,
+                ref_image=ref_image_np,
+                ref_masked_image=None,
+                ref_image_aug=ref_image_aug,
+                ref_mask_aug=ref_masked_image_aug,
+                caption=vid_caption,
+                fps=fps,
+            )
+            self.debug_counter += 1
+        
+        outputs = {
+            'target_images': target_images,      # [F, C, H, W]
+            'masked_video': masked_video,        # [F, C, H, W]
+            'mask_video': mask_video,            # [F, 1, H, W]
+            'mask_image': mask_image,            # [1, H, W]
+            'ref_image': ref_image_aug,          # [C, H, W] - augmented
+            'ref_masked_image': ref_masked_image_aug, # [1, H, W] - binary mask, augmented
             'caption': vid_caption,
             'fps': fps,
         }
@@ -547,6 +774,25 @@ class InpaintingDataset(Dataset):
 # ============================================================================
 # Standalone Debug Script Entry Point
 # ============================================================================
+def _process_single_sample(args_tuple):
+    """Worker function for multi-threaded processing."""
+    idx, dataset, total = args_tuple
+    try:
+        sample = dataset[idx]
+        return {
+            'idx': idx,
+            'success': True,
+            'target_images': sample['target_images'].shape,
+            'masked_video': sample['masked_video'].shape,
+            'mask_video': sample['mask_video'].shape,
+            'mask_image': sample['mask_image'].shape,
+            'ref_image': sample['ref_image'].shape,
+            'ref_masked_image': sample['ref_masked_image'].shape,
+            'caption': sample['caption'][:50] if sample['caption'] else '',
+        }
+    except Exception as e:
+        return {'idx': idx, 'success': False, 'error': str(e)}
+
 
 def debug_dataset(
     csv_file: str,
@@ -554,14 +800,14 @@ def debug_dataset(
     output_dir: str = "./debug_outputs",
     num_samples: int = 5,
     nframes: int = 81,
+    num_workers: int = 1,
+    use_pregenerated: bool = False,
+    pregenerated_data_root: str = None,
 ):
-    """
-    Standalone function to debug/visualize dataset outputs.
-    
-    Usage:
-        python dataset_inpaint.py --csv_file /path/to/data.csv --data_root /path/to/videos --output_dir ./debug --num_samples 5
-    """
     from dataclasses import dataclass
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+    import glob
     
     @dataclass
     class DebugArgs:
@@ -575,27 +821,114 @@ def debug_dataset(
         nframes=nframes,
     )
     
-    dataset = InpaintingDataset(
-        args,
-        save_debug=True,
-        debug_output_dir=output_dir,
-        debug_save_prob=1.0,  # Save all samples in debug mode
-    )
+    if use_pregenerated:
+        print(f"Using PreGeneratedInpaintingDataset with root: {pregenerated_data_root}")
+        dataset = PreGeneratedInpaintingDataset(
+            args,
+            pregenerated_data_root=pregenerated_data_root,
+            save_debug=True,
+            debug_output_dir=output_dir,
+            debug_save_prob=1.0,
+        )
+    else:
+        print("Using InpaintingDataset with online mask generation")
+        dataset = InpaintingDataset(
+            args,
+            save_debug=True,
+            debug_output_dir=output_dir,
+            debug_save_prob=1.0,
+        )
     
+    actual_samples = min(num_samples, len(dataset))
     print(f"Dataset length: {len(dataset)}")
-    print(f"Saving {num_samples} samples to {output_dir}")
+    print(f"Processing {actual_samples} samples with {num_workers} workers")
+    print(f"Output directory: {output_dir}")
     
-    for i in range(min(num_samples, len(dataset))):
-        print(f"Processing sample {i+1}/{num_samples}...")
-        sample = dataset[i]
-        print(f"  target_images: {sample['target_images'].shape}")
-        print(f"  masked_video: {sample['masked_video'].shape}")
-        print(f"  mask_video: {sample['mask_video'].shape}")
-        print(f"  mask_image: {sample['mask_image'].shape}")
-        print(f"  ref_image: {sample['ref_image'].shape}")
-        print(f"  caption: {sample['caption'][:50]}...")
+    # Read original CSV to get video paths
+    original_metadata = []
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            original_metadata.append(row)
     
+    if num_workers <= 1:
+        # Sequential processing
+        for i in tqdm(range(actual_samples), desc="Processing samples"):
+            sample = dataset[i]
+    else:
+        # Multi-threaded processing
+        results = []
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(_process_single_sample, (i, dataset, actual_samples)): i 
+                for i in range(actual_samples)
+            }
+            
+            for future in tqdm(as_completed(futures), total=actual_samples, desc="Processing samples"):
+                result = future.result()
+                results.append(result)
+                if not result['success']:
+                    print(f"  [Sample {result['idx']+1}] FAILED: {result['error']}")
+        
+        success_count = sum(1 for r in results if r['success'])
+        print(f"\nProcessed {success_count}/{actual_samples} samples successfully")
+    
+    # Generate CSV from saved outputs
+    print("\nGenerating training_data.csv...")
+    output_path = Path(output_dir)
+    csv_rows = []
+    
+    # Find all sample directories
+    sample_dirs = sorted(glob.glob(str(output_path / "sample_*")))
+    print(f"Found {len(sample_dirs)} sample directories")
+    
+    for sample_dir in sample_dirs:
+        sample_dir = Path(sample_dir)
+        mask_path = sample_dir / "mask.png"
+        ref_image_path = sample_dir / "ref_image.png"
+        caption_path = sample_dir / "caption.txt"
+        
+        if not mask_path.exists() or not ref_image_path.exists():
+            continue
+        
+        # Read caption
+        caption = ""
+        if caption_path.exists():
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+        
+        # Get sample index from directory name
+        sample_idx = int(sample_dir.name.split('_')[1])
+        
+        # Get original video path if available
+        video_path = ""
+        if sample_idx < len(original_metadata):
+            video_path = original_metadata[sample_idx].get('video_path', 
+                         original_metadata[sample_idx].get('vid_path', ''))
+        
+        # Use relative paths
+        rel_mask = os.path.relpath(mask_path, output_dir)
+        rel_ref = os.path.relpath(ref_image_path, output_dir)
+        
+        csv_rows.append({
+            'video_path': video_path,
+            'mask_path': rel_mask,
+            'ref_image_path': rel_ref,
+            'caption': caption,
+        })
+    
+    # Write CSV
+    csv_output_path = output_path / "training_data.csv"
+    with open(csv_output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['video_path', 'mask_path', 'ref_image_path', 'caption'])
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    
+    print(f"\nGenerated CSV with {len(csv_rows)} samples: {csv_output_path}")
     print(f"\nDone! Check outputs in {output_dir}")
+    print(f"\nTo use with PreGeneratedInpaintingDataset:")
+    print(f"  csv_file_list: ['{csv_output_path}']")
+    print(f"  pregenerated_data_root: '{output_dir}'")
 
 
 if __name__ == "__main__":
@@ -607,6 +940,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./debug_outputs", help="Output directory")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to save")
     parser.add_argument("--nframes", type=int, default=81, help="Number of frames")
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers")
+    parser.add_argument("--use_pregenerated", action="store_true", help="Use pre-generated mask/ref_image")
+    parser.add_argument("--pregenerated_data_root", type=str, default=None, help="Root directory for pre-generated data")
     
     args = parser.parse_args()
     
@@ -616,4 +952,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         num_samples=args.num_samples,
         nframes=args.nframes,
+        num_workers=args.num_workers,
+        use_pregenerated=args.use_pregenerated,
+        pregenerated_data_root=args.pregenerated_data_root,
     )

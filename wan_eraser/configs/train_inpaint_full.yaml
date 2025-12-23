@@ -1,0 +1,97 @@
+# ============================================================================
+# Video Inpainting Training Config (Full Fine-tuning)
+# 用于 train_wan_sft_inpaint.py + dataset_inpaint.py
+# ============================================================================
+
+experiment:
+  output_dirpath: "./outputs/inpaint_full"
+  random_seed: 42
+  run_id: "inpaint_full_v1"
+  name: "video_inpainting"
+  ic_debug: false
+  use_lora: false  # 全量微调
+  validation_prompts:
+    - - "/path/to/test_video.mp4"
+      - "/path/to/test_mask.mp4"
+      - "A person walking in the park"
+      - "blurry, low quality, static"
+  video_sample_n_frames: 81
+  validation_steps: 5000
+
+data:
+  batch_size: 1
+  nframes: 81
+  data_root: "/mnt/cfs/shanhai/liuh/datasets/raw_data/"
+  csv_file_list:
+    - "/path/to/your/train_data.csv"  # 需要修改为你的CSV路径
+  mask_csv_file_list: []
+  dataloader_kwargs:
+    drop_last: true
+    num_workers: 4
+    persistent_workers: true
+    pin_memory: true
+    prefetch_factor: 2
+
+model:
+  pretrained_model_name_or_path: "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/"
+  revision: null
+  variant: null
+
+network:
+  lora_rank: 128
+  lora_alpha: 128
+  target_modules: null
+  lora_dropout: 0.05
+  train_norm_layers: false
+  init_lora_weights: true
+  lora_layers: "all-linear"
+
+hparams:
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-05
+  optimizer_type: "optimi-stableadamw"
+  optimizer_args:
+    - "weight_decay=1e-2"
+    - "eps=1e-8"
+    - "betas=(0.9, 0.95)"
+  max_grad_norm: 1.0
+  grad_clip_method: "norm"
+  lr_scheduler: "constant_with_warmup"
+  lr_warmup_steps: 500
+  lr_scheduler_num_cycles: 1
+  lr_scheduler_power: 0.9
+  guidance_scale: 1.0
+  num_train_epochs: 5
+  max_train_steps: null
+  caption_dropout_p: 0.0
+  gradient_precision: "accelerator"
+  fsdp_sharding_startegy: "full"
+  use_cpu_offload: false
+  flow_match:
+    discrete_flow_shift: 7.0
+    timestep_sampling: "logit_normal"
+    weighting_scheme: "none"
+    sigmoid_scale: 1.0
+    logit_mean: 0.0
+    logit_std: 1.0
+  ema:
+    use_ema: false
+    ema_decay: 0.99
+    ema_foreach_disable: false
+    ema_device: "accelerator"
+    ema_cpu_only: false
+    ema_update_interval: null
+
+checkpointing:
+  save_every_n_steps: 1000
+  save_last_n_steps: 5000
+  resume_from_checkpoint: null
+  resume_from_lora_checkpoint: null
+
+ddp_kwargs:
+  backend: "nccl"
+  find_unused_parameters: false
+  gradient_as_bucket_view: false
+  static_graph: false
