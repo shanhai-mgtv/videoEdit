@@ -45,7 +45,7 @@ def prepare_latents(
     latents = retrieve_latents(
         latents,
         generator,
-        sample_mode="argmax",
+        sample_mode="sample",  # 与训练一致
     )
 
     latents = normalize_latents(
@@ -282,7 +282,6 @@ def infer(
         mask_lat_size = F.interpolate(
             mask_lat_size, scale_factor=1 / 16, mode="nearest-exact"
         )
-        print(mask_lat_size.shape,"mask_lat_sizemask_lat_size")
 
         num_frames, _, latent_height, latent_width = mask_lat_size.shape
         mask_lat_size = mask_lat_size.view(
@@ -295,6 +294,7 @@ def infer(
                 video_transforms = transforms.Compose(
                     [
                         transforms.Lambda(lambda x: x / 255.0),
+                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ]
                 )
 
@@ -314,28 +314,33 @@ def infer(
                     # masked_video: mask==1 区域置零
                     masked_video = image_or_video * (1 - mask_seq)
 
-                    masked_video_processed = pipeline.video_processor.preprocess_video(
-                        masked_video,
-                        height=masked_video.size(2),
-                        width=masked_video.size(3),
-                    )
+                    # ========== DEBUG: 检查输入数据范围 ==========
+                    print(f"[DEBUG] image_or_video: shape={image_or_video.shape}, min={image_or_video.min():.4f}, max={image_or_video.max():.4f}")
+                    print(f"[DEBUG] mask_seq: shape={mask_seq.shape}, min={mask_seq.min():.4f}, max={mask_seq.max():.4f}, sum={mask_seq.sum():.0f}")
+                    print(f"[DEBUG] masked_video: shape={masked_video.shape}, min={masked_video.min():.4f}, max={masked_video.max():.4f}")
+
+                    # masked_video: [F, C, H, W] -> [1, C, F, H, W]
+                    masked_video_5d = masked_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1, C, F, H, W]
 
                     # 编码 masked_video 到 latent
-                    masked_video_latents = prepare_latents(vae, masked_video_processed)
+                    masked_video_latents = prepare_latents(vae, masked_video_5d)
                     masked_video_latents = masked_video_latents.to(dtype=load_dtype)
+                    print(f"[DEBUG] masked_video_latents: shape={masked_video_latents.shape}, min={masked_video_latents.min():.4f}, max={masked_video_latents.max():.4f}")
                     
                     # 准备 ref_image latent
                     # ref_image: [H, W, C] -> [1, C, H, W] -> resize -> [1, C, infer_h, infer_w]
                     ref_tensor = torch.from_numpy(ref_image).permute(2, 0, 1).unsqueeze(0).float()
                     ref_tensor = F.interpolate(ref_tensor, size=(infer_h, infer_w), mode="bicubic")
-                    ref_tensor = ref_tensor / 255.0
+                    ref_tensor = ref_tensor / 255.0 * 2 - 1
                     ref_tensor = ref_tensor.to(device=device, dtype=load_dtype)
+                    print(f"[DEBUG] ref_tensor: shape={ref_tensor.shape}, min={ref_tensor.min():.4f}, max={ref_tensor.max():.4f}")
+                    
                     # ref_img: [B, C, H, W] -> [B, C, 1, H, W] for VAE encoding
                     ref_img_video = ref_tensor.unsqueeze(2)  # [1, C, 1, H, W]
                     ref_latents = prepare_latents(vae, ref_img_video)
                     ref_latents = ref_latents.to(dtype=load_dtype)  # [1, 16, 1, h, w]
+                    print(f"[DEBUG] ref_latents: shape={ref_latents.shape}, min={ref_latents.min():.4f}, max={ref_latents.max():.4f}")
                     
-                    # 准备 ref_mask latent (reference image mask at latent size)
                     # 如果提供了 ref_mask，使用它；否则使用全 1（使用完整参考图）
                     if ref_mask is not None:
                         ref_mask_tensor = torch.from_numpy(ref_mask).float().unsqueeze(0).unsqueeze(0)
@@ -344,12 +349,15 @@ def infer(
                     else:
                         ref_mask_tensor = torch.ones(1, 1, infer_h, infer_w)
                     ref_mask_tensor = ref_mask_tensor.to(device=device, dtype=load_dtype)
+                    print(f"[DEBUG] ref_mask_tensor: shape={ref_mask_tensor.shape}, min={ref_mask_tensor.min():.4f}, max={ref_mask_tensor.max():.4f}")
+                    
                     # 缩放到 latent 尺寸
                     mask_img_lat_size = F.interpolate(ref_mask_tensor, scale_factor=1/16, mode="nearest-exact")
                     mask_img_lat_size = mask_img_lat_size.unsqueeze(2).repeat(1, 4, 1, 1, 1)  # [1, 4, 1, h, w]
+                    print(f"[DEBUG] mask_img_lat_size: shape={mask_img_lat_size.shape}, min={mask_img_lat_size.min():.4f}, max={mask_img_lat_size.max():.4f}")
+                    print(f"[DEBUG] mask_lat_size (cond_masks): shape={mask_lat_size.shape}, min={mask_lat_size.min():.4f}, max={mask_lat_size.max():.4f}")
+                    print("=" * 60)
 
-                    print(mask_img_lat_size.shape,"mask_img_lat_sizemask_img_lat_size")
-                    
                 gen_latent = pipeline(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
@@ -367,11 +375,17 @@ def infer(
                     strength=strength,
                 ).frames
 
+                # ========== DEBUG: 检查 pipeline 输出 ==========
+                print(f"[DEBUG] gen_latent: shape={gen_latent.shape}, min={gen_latent.min():.4f}, max={gen_latent.max():.4f}, mean={gen_latent.mean():.4f}, std={gen_latent.std():.4f}")
+                
                 with torch.inference_mode():
                     gen_video = post_latents(vae, gen_latent)
+                    print(f"[DEBUG] gen_video (after post_latents): shape={gen_video.shape}, min={gen_video.min():.4f}, max={gen_video.max():.4f}, mean={gen_video.mean():.4f}, std={gen_video.std():.4f}")
+                    
                     gen_video = pipeline.video_processor.postprocess_video(
                         gen_video, output_type="pt"
                     )[0]
+                    print(f"[DEBUG] gen_video (after postprocess): shape={gen_video.shape}, min={gen_video.min():.4f}, max={gen_video.max():.4f}, mean={gen_video.mean():.4f}, std={gen_video.std():.4f})")
 
                 gen_video = (
                     (gen_video * 255.0)
@@ -381,6 +395,7 @@ def infer(
                     .cpu()
                     .numpy()
                 )
+                print(f"[DEBUG] gen_video (final numpy): shape={gen_video.shape}, min={gen_video.min()}, max={gen_video.max()}, mean={gen_video.mean():.2f}, std={gen_video.std():.2f}")
 
                 generated_frames += [
                     cv2.resize(video_frame, (W, H)) for video_frame in gen_video
@@ -396,11 +411,17 @@ def infer(
 
 def main():
     parser = argparse.ArgumentParser(description="Video inpainting with mask image and reference image")
-    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0005/original.mp4", help="Input video path")
-    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0005/mask.png", help="Mask image path (single image)")
-    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0005/ref_image_aug.png", help="Reference image path")
-    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0005/output_yuan_more_prompt.mp4", help="Output video path")
-    parser.add_argument("--prompt", type=str, default="A bald and chubby man is speaking.", help="Prompt for generation")
+    # parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/target_video.mp4", help="Input video path")
+    # parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/mask_image.png", help="Mask image path (single image)")
+    # parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_image.png", help="Reference image path")
+    # parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/out_2.mp4", help="Output video path")
+    # parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_masked_image.png", )
+    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0015/original.mp4", help="Input video path")
+    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0015/mask.png", help="Mask image path (single image)")
+    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0015/ref_image_aug.png", help="Reference image path")
+    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0015/out_0002_argmax_refnorm_again.mp4", help="Output video path")
+    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0015/ref_mask_aug.png", )
+    parser.add_argument("--prompt", type=str, default="A man is talking.", help="Prompt for generation")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -417,14 +438,8 @@ def main():
         "--lora_path",
         type=str,
         # default = None,
-        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002200/lora_adapter",
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002800/lora_adapter",
         help="LoRA adapter path (directory containing adapter_model.safetensors and adapter_config.json)",
-    )
-    parser.add_argument(
-        "--ref_mask_path",
-        type=str,
-        default=None,
-        help="Reference mask image path (optional, if not provided, use full reference image)",
     )
     parser.add_argument(
         "--negative_prompt",

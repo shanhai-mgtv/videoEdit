@@ -22,10 +22,10 @@ data:
   mask_csv_file_list: [] 
   dataloader_kwargs:
     drop_last: true
-    num_workers: 4
-    persistent_workers: true
-    pin_memory: true
-    prefetch_factor: 2
+    num_workers: 1
+    persistent_workers: false  
+    pin_memory: false  
+    prefetch_factor: 1
 
 model:
   pretrained_model_name_or_path: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/base"
@@ -87,7 +87,7 @@ hparams:
 checkpointing:
   save_every_n_steps: 100
   save_last_n_steps: 1000
-  resume_from_checkpoint: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002200"
+  resume_from_checkpoint: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002800"
   resume_from_lora_checkpoint: null 
 
 ddp_kwargs:

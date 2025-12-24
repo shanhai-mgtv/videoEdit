@@ -1000,7 +1000,7 @@ def main(cfg: Config):
                     )
 
                 batch_size = latents.size(0)
-                
+
                 # ============================================
                 # Add noise to ground truth
                 # ============================================

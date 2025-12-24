@@ -63,12 +63,15 @@ class DataConfig(BaseConfig):
                                                     "/mnt/cfs/shanhai/liuh/LTX_VideoInpainting_095/datas/mgtvshow_data.csv"], is_mutable=True)
     mask_csv_file_list: typing.List[str] = field(default=[
                                                     "/mnt/cfs/shanhai/liuh/LTX_VideoInpainting_095/datas/train_mask.csv"], is_mutable=True)
-    pretrained_model_name_or_path: str = "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/" 
+    pretrained_model_name_or_path: str = "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/"
+    # Pre-generated data settings
+    use_pregenerated_data: bool = field(default=False)  # Use pre-generated mask/ref_image instead of online generation
+    pregenerated_data_root: typing.Optional[str] = field(default=None)  # Root directory for pre-generated data 
 
 @dataclass
 class PretrainedModelConfig(BaseConfig):
     """Configuration for pretrained model loading"""
-
+    pretrained_model_transformer_name_or_path: str = "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/"
     pretrained_model_name_or_path: str = "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/"  # Path or name of pretrained model
     revision: typing.Optional[str] = field(default=None)  # Specific model revision to use
     variant: typing.Optional[str] = field(default=None)  # Specific model variant to use
