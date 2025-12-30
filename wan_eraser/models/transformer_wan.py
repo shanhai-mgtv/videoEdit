@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -406,6 +406,187 @@ class WanRotaryPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+class WanRotaryPosEmbedWithRefFrame(nn.Module):
+    """
+    RoPE with distinct position encoding for reference/condition frames.
+    
+    Hybrid approach (similar to Qwen's QwenEmbedLayer3DRope):
+    - Video frames use sequential positive indices: 0, 1, 2, ...
+    - Reference image frame uses negative frame index: -1
+    
+    This creates a distinct positional encoding for condition images,
+    allowing the model to differentiate between target frames and reference frames.
+    
+    Args:
+        frame_segments: List of (num_frames, is_reference) tuples describing the frame structure.
+                       e.g., [(21, False), (21, False), (1, True)] means:
+                       - 21 frames of target video (indices 0-20)
+                       - 21 frames of masked video (indices 21-41, sequential)
+                       - 1 frame of reference image (index -1, special marker)
+    """
+    def __init__(
+        self,
+        attention_head_dim: int,
+        patch_size: Tuple[int, int, int],
+        max_seq_len: int,
+        theta: float = 10000.0,
+    ):
+        super().__init__()
+
+        self.attention_head_dim = attention_head_dim
+        self.patch_size = patch_size
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+
+        h_dim = w_dim = 2 * (attention_head_dim // 6)
+        t_dim = attention_head_dim - h_dim - w_dim
+        self.dims = [t_dim, h_dim, w_dim]
+        self.freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        # Pre-compute positive and negative frequency tables
+        # Positive indices: 0 to max_seq_len-1
+        pos_freqs_cos = []
+        pos_freqs_sin = []
+        for dim in self.dims:
+            freq_cos, freq_sin = get_1d_rotary_pos_embed(
+                dim, max_seq_len, theta,
+                use_real=True, repeat_interleave_real=True, freqs_dtype=self.freqs_dtype,
+            )
+            pos_freqs_cos.append(freq_cos)
+            pos_freqs_sin.append(freq_sin)
+        self.register_buffer("pos_freqs_cos", torch.cat(pos_freqs_cos, dim=1), persistent=False)
+        self.register_buffer("pos_freqs_sin", torch.cat(pos_freqs_sin, dim=1), persistent=False)
+
+        # Negative indices: -max_seq_len to -1 (for reference frames)
+        neg_freqs_cos = []
+        neg_freqs_sin = []
+        neg_indices = torch.arange(max_seq_len).flip(0) * -1 - 1  # [-max_seq_len, ..., -2, -1]
+        for dim in self.dims:
+            freq_cos, freq_sin = get_1d_rotary_pos_embed(
+                dim, neg_indices, theta,
+                use_real=True, repeat_interleave_real=True, freqs_dtype=self.freqs_dtype,
+            )
+            neg_freqs_cos.append(freq_cos)
+            neg_freqs_sin.append(freq_sin)
+        self.register_buffer("neg_freqs_cos", torch.cat(neg_freqs_cos, dim=1), persistent=False)
+        self.register_buffer("neg_freqs_sin", torch.cat(neg_freqs_sin, dim=1), persistent=False)
+
+    def _compute_freqs_for_segment(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        frame_start_idx: int = 0,
+        use_negative_idx: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute RoPE frequencies for a segment of frames.
+        
+        Args:
+            num_frames: Number of frames in this segment (after patch)
+            height: Height after patch
+            width: Width after patch
+            frame_start_idx: Starting frame index (for positive indices)
+            use_negative_idx: If True, use negative index -1 for all frames (reference image)
+        """
+        split_sizes = [
+            self.attention_head_dim - 2 * (self.attention_head_dim // 3),
+            self.attention_head_dim // 3,
+            self.attention_head_dim // 3,
+        ]
+
+        if use_negative_idx:
+            # Reference frame: use negative index -1 for frame dimension
+            freqs_cos_split = self.neg_freqs_cos.split(split_sizes, dim=1)
+            freqs_sin_split = self.neg_freqs_sin.split(split_sizes, dim=1)
+            # Use the last entry (index -1)
+            freqs_cos_f = freqs_cos_split[0][-1:].view(1, 1, 1, -1).expand(num_frames, height, width, -1)
+            freqs_sin_f = freqs_sin_split[0][-1:].view(1, 1, 1, -1).expand(num_frames, height, width, -1)
+        else:
+            # Normal frames: use positive indices
+            freqs_cos_split = self.pos_freqs_cos.split(split_sizes, dim=1)
+            freqs_sin_split = self.pos_freqs_sin.split(split_sizes, dim=1)
+            freqs_cos_f = freqs_cos_split[0][frame_start_idx:frame_start_idx + num_frames]
+            freqs_cos_f = freqs_cos_f.view(num_frames, 1, 1, -1).expand(num_frames, height, width, -1)
+            freqs_sin_f = freqs_sin_split[0][frame_start_idx:frame_start_idx + num_frames]
+            freqs_sin_f = freqs_sin_f.view(num_frames, 1, 1, -1).expand(num_frames, height, width, -1)
+
+        # Height and width use positive indices (spatial position is the same)
+        pos_cos_split = self.pos_freqs_cos.split(split_sizes, dim=1)
+        pos_sin_split = self.pos_freqs_sin.split(split_sizes, dim=1)
+        
+        freqs_cos_h = pos_cos_split[1][:height].view(1, height, 1, -1).expand(num_frames, height, width, -1)
+        freqs_cos_w = pos_cos_split[2][:width].view(1, 1, width, -1).expand(num_frames, height, width, -1)
+        freqs_sin_h = pos_sin_split[1][:height].view(1, height, 1, -1).expand(num_frames, height, width, -1)
+        freqs_sin_w = pos_sin_split[2][:width].view(1, 1, width, -1).expand(num_frames, height, width, -1)
+
+        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1)
+        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1)
+        
+        return freqs_cos, freqs_sin
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        frame_segments: Optional[List[Tuple[int, bool]]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: [B, C, F, H, W]
+            frame_segments: List of (num_frames, is_reference) tuples.
+                           If None, treats all frames as normal (positive indices).
+                           
+                           Hybrid approach example: [(21, False), (21, False), (1, True)]
+                           - First 21 frames: target video (idx 0-20)
+                           - Next 21 frames: masked video (idx 21-41, sequential)
+                           - Last 1 frame: reference image (idx -1, special marker)
+        """
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+
+        if frame_segments is None:
+            # Default behavior: all frames use positive indices
+            freqs_cos, freqs_sin = self._compute_freqs_for_segment(
+                ppf, pph, ppw, frame_start_idx=0, use_negative_idx=False
+            )
+            freqs_cos = freqs_cos.reshape(1, ppf * pph * ppw, 1, -1)
+            freqs_sin = freqs_sin.reshape(1, ppf * pph * ppw, 1, -1)
+            return freqs_cos, freqs_sin
+
+        # Build freqs for each segment with hybrid approach:
+        # - Video segments use sequential positive indices (cumulative)
+        # - Reference segments use negative index -1
+        all_freqs_cos = []
+        all_freqs_sin = []
+        current_frame_idx = 0  # Cumulative frame index for sequential encoding
+        
+        for segment_frames, is_reference in frame_segments:
+            # Convert to post-patch frame count
+            pp_segment_frames = segment_frames // p_t
+            
+            freqs_cos, freqs_sin = self._compute_freqs_for_segment(
+                pp_segment_frames, pph, ppw,
+                frame_start_idx=current_frame_idx,  # Use cumulative index for sequential encoding
+                use_negative_idx=is_reference,
+            )
+            # Reshape to sequence
+            freqs_cos = freqs_cos.reshape(pp_segment_frames * pph * ppw, -1)
+            freqs_sin = freqs_sin.reshape(pp_segment_frames * pph * ppw, -1)
+            all_freqs_cos.append(freqs_cos)
+            all_freqs_sin.append(freqs_sin)
+            
+            # Only increment frame index for non-reference segments
+            if not is_reference:
+                current_frame_idx += pp_segment_frames
+
+        # Concatenate all segments
+        freqs_cos = torch.cat(all_freqs_cos, dim=0).unsqueeze(0).unsqueeze(2)  # [1, L, 1, D]
+        freqs_sin = torch.cat(all_freqs_sin, dim=0).unsqueeze(0).unsqueeze(2)  # [1, L, 1, D]
+
+        return freqs_cos, freqs_sin
+
+
 @maybe_allow_in_graph
 class WanTransformerBlock(nn.Module):
     def __init__(
@@ -455,7 +636,18 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, seq_len, dim]
+            encoder_hidden_states: text embeddings for cross-attention
+            temb: timestep embeddings
+            rotary_emb: rotary position embeddings
+            attention_mask: Optional attention mask for self-attention [B, 1, seq_len, seq_len]
+                           Used to mask reference background tokens.
+                           0 = attend, -inf = mask out
+        """
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -474,9 +666,9 @@ class WanTransformerBlock(nn.Module):
                 self.scale_shift_table + temb.float()
             ).chunk(6, dim=1)
 
-        # 1. Self-attention
+        # 1. Self-attention with optional mask for reference tokens
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+        attn_output = self.attn1(norm_hidden_states, None, attention_mask, rotary_emb)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -559,6 +751,7 @@ class WanTransformer3DModel(
         added_kv_proj_dim: Optional[int] = None,
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: Optional[int] = None,
+        use_ref_frame_rope: bool = False,
     ) -> None:
         super().__init__()
 
@@ -566,7 +759,12 @@ class WanTransformer3DModel(
         out_channels = out_channels or in_channels
 
         # 1. Patch & position embedding
-        self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
+        # Use WanRotaryPosEmbedWithRefFrame if use_ref_frame_rope is True
+        # This allows distinct RoPE for reference/condition frames (negative indices)
+        if use_ref_frame_rope:
+            self.rope = WanRotaryPosEmbedWithRefFrame(attention_head_dim, patch_size, rope_max_seq_len)
+        else:
+            self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
 
         # 2. Condition embeddings
@@ -605,7 +803,32 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        frame_segments: Optional[List[Tuple[int, bool]]] = None,
+        ref_token_mask: Optional[torch.Tensor] = None,
+        video_token_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args:
+            hidden_states: Input tensor [B, C, F, H, W]
+            timestep: Timestep tensor
+            encoder_hidden_states: Text embeddings
+            encoder_hidden_states_image: Optional image embeddings
+            return_dict: Whether to return a dict
+            attention_kwargs: Additional attention kwargs
+            frame_segments: Optional list of (num_frames, is_reference) tuples for RoPE.
+                           Used when use_ref_frame_rope=True to distinguish reference frames.
+                           Example: [(21, False), (21, False), (1, True)] means:
+                           - 21 frames: target video (positive indices 0-20)
+                           - 21 frames: masked video (positive indices 0-20)
+                           - 1 frame: reference image (negative index -1)
+            ref_token_mask: Optional mask for reference tokens [B, num_ref_tokens]
+                           1 = foreground (can interact), 0 = background (masked out)
+                           Used to mask out background tokens in reference frame.
+            video_token_mask: Optional mask for video tokens [B, num_video_tokens_per_branch, num_branches]
+                           or [B, num_noisy_tokens, num_masked_tokens]
+                           1 = visible region (can interact), 0 = masked region (masked out)
+                           Used to mask out occluded tokens in masked_video branch.
+        """
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -627,7 +850,11 @@ class WanTransformer3DModel(
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        rotary_emb = self.rope(hidden_states)
+        # Compute RoPE with optional frame_segments for reference frame distinction
+        if self.config.use_ref_frame_rope and frame_segments is not None:
+            rotary_emb = self.rope(hidden_states, frame_segments=frame_segments)
+        else:
+            rotary_emb = self.rope(hidden_states)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -652,15 +879,59 @@ class WanTransformer3DModel(
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
+        # Build attention mask for reference and video token masking
+        # ref_token_mask: [B, num_ref_tokens], 1=foreground, 0=background
+        attention_mask = None
+        if ref_token_mask is not None or video_token_mask is not None:
+            seq_len = hidden_states.shape[1]
+            attn_mask = torch.zeros(batch_size, seq_len, seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
+            
+            # Apply ref_token_mask: bidirectional masking for background ref tokens
+            # Paper Figure 3: 背景ref token既不被关注（列mask），也不关注其他token（行mask）
+            if ref_token_mask is not None:
+                num_ref_tokens = ref_token_mask.shape[1]
+                num_video_tokens = seq_len - num_ref_tokens
+                
+                # 列屏蔽：其他token不能attend到ref背景token
+                # attn_mask[:, :, num_video_tokens:]: shape [B, seq_len, num_ref_tokens]
+                ref_mask_col = ref_token_mask.unsqueeze(1).expand(-1, seq_len, -1)  # [B, seq_len, num_ref_tokens]
+                attn_mask[:, :, num_video_tokens:] = torch.where(
+                    ref_mask_col > 0.5,
+                    torch.zeros_like(ref_mask_col),
+                    torch.full_like(ref_mask_col, float('-inf'))
+                )
+                
+                # 行屏蔽：ref背景token不能attend到任何token
+                # attn_mask[:, num_video_tokens:, :]: shape [B, num_ref_tokens, seq_len]
+                ref_mask_row = ref_token_mask.unsqueeze(2).expand(-1, -1, seq_len)  # [B, num_ref_tokens, seq_len]
+                attn_mask[:, num_video_tokens:, :] = torch.where(
+                    ref_mask_row > 0.5,
+                    attn_mask[:, num_video_tokens:, :].clone(), 
+                    torch.full_like(ref_mask_row, float('-inf'))
+                )
+            
+            if video_token_mask is not None:
+                num_tokens_per_branch = video_token_mask.shape[1]
+                start_idx = num_tokens_per_branch
+                end_idx = 2 * num_tokens_per_branch
+                video_mask_expanded = video_token_mask.unsqueeze(1).expand(-1, seq_len, -1)
+                attn_mask[:, :, start_idx:end_idx] = torch.where(
+                    video_mask_expanded > 0.5,
+                    attn_mask[:, :, start_idx:end_idx].clone(), 
+                    torch.full_like(video_mask_expanded, float('-inf'))
+                )
+
+            attention_mask = attn_mask.unsqueeze(1)
+
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_mask
                 )
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_mask)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:

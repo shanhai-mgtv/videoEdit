@@ -490,8 +490,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         cond_masks: Optional[torch.Tensor] = None,
         ref_latents: Optional[torch.Tensor] = None,
         mask_img_latents: Optional[torch.Tensor] = None,
-        ref_token_mask: Optional[torch.Tensor] = None,
-        video_token_mask: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "np",
@@ -704,8 +702,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         frame_segments=frame_segments,
-                        ref_token_mask=ref_token_mask,
-                        video_token_mask=video_token_mask,
                         return_dict=False,
                     )[0]
                     # Extract only the first F frames (corresponding to noisy_gt prediction)
@@ -720,8 +716,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             encoder_hidden_states=negative_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             frame_segments=frame_segments,
-                            ref_token_mask=ref_token_mask,
-                            video_token_mask=video_token_mask,
                             return_dict=False,
                         )[0]
                         # Extract only the first F frames

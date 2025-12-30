@@ -486,12 +486,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
-        cond_latents: Optional[torch.Tensor] = None,
-        cond_masks: Optional[torch.Tensor] = None,
-        ref_latents: Optional[torch.Tensor] = None,
-        mask_img_latents: Optional[torch.Tensor] = None,
-        ref_token_mask: Optional[torch.Tensor] = None,
-        video_token_mask: Optional[torch.Tensor] = None,
+        masked_video_latents: Optional[torch.Tensor] = None,  # [B, C, F, h, w] 遮罩后的视频 latents
+        mask_lat_size: Optional[torch.Tensor] = None,  # [B, 4, F, h, w] 视频 mask
+        mask_img_lat_size: Optional[torch.Tensor] = None,  # [B, 4, 1, h, w] 参考图 mask
+        ref_latents: Optional[torch.Tensor] = None,  # [B, C, 1, h, w] 参考图 latents
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "np",
@@ -675,27 +673,25 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 current_model = self.transformer
                 current_guidance_scale = guidance_scale
 
-
-                # Three-branch temporal + channel fusion (matching training)
-                branch1 = torch.cat([latents, cond_latents, ref_latents], dim=2)
-                zeros_4ch = torch.zeros_like(cond_masks)
-                branch2 = torch.cat([zeros_4ch, cond_masks, mask_img_latents], dim=2)
-                zeros_16ch = torch.zeros_like(latents)
-                branch3 = torch.cat([zeros_16ch, cond_latents, ref_latents], dim=2)
-                
-                # [B, 48, 2F+1, H, W] + [B, 4, 2F+1, H, W] + [B, 48, 2F+1, H, W] -> [B, 100, 43, H, W]
-                latent_model_input = torch.cat([branch1, branch2, branch3], dim=1).to(transformer_dtype)
-                
-                timestep = t.expand(latents.shape[0])
-
                 num_latent_frames = latents.shape[2]  # F
                 ref_num_frames = ref_latents.shape[2]  # 1
+                zeros_latents = torch.zeros_like(masked_video_latents)
                 
+                branch1 = torch.cat([latents, ref_latents], dim=2)  # [B, C, F+1, h, w]
+                branch2 = torch.cat([masked_video_latents, ref_latents], dim=2)  # [B, C, F+1, h, w]
+                branch3 = torch.cat([mask_lat_size, mask_img_lat_size], dim=2)  # [B, 4, F+1, h, w]
+                branch4 = torch.cat([zeros_latents, ref_latents], dim=2)  # [B, C, F+1, h, w]
+                
+                latent_model_input = torch.cat([branch1, branch2, branch3, branch4], dim=1).to(transformer_dtype)
+                
+                # frame_segments 定义 RoPE 位置编码
                 frame_segments = [
-                    (num_latent_frames, False),  
-                    (num_latent_frames, False),  
-                    (ref_num_frames, True),       # ref_img位置编码 -1
+                    (num_latent_frames, False),
+                    (num_latent_frames, False),
+                    (ref_num_frames, False),
                 ]
+                
+                timestep = t.expand(latents.shape[0])
                 
                 with current_model.cache_context("cond"):
                     noise_pred_full = current_model(
@@ -704,12 +700,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         frame_segments=frame_segments,
-                        ref_token_mask=ref_token_mask,
-                        video_token_mask=video_token_mask,
                         return_dict=False,
                     )[0]
-                    # Extract only the first F frames (corresponding to noisy_gt prediction)
-                    # noise_pred_full: [B, 16, 2F+1, H, W] -> noise_pred: [B, 16, F, H, W]
                     noise_pred = noise_pred_full[:, :, :num_latent_frames, :, :]
 
                 if self.do_classifier_free_guidance:
@@ -720,8 +712,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             encoder_hidden_states=negative_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             frame_segments=frame_segments,
-                            ref_token_mask=ref_token_mask,
-                            video_token_mask=video_token_mask,
                             return_dict=False,
                         )[0]
                         # Extract only the first F frames
