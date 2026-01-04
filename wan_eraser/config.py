@@ -63,6 +63,8 @@ class DataConfig(BaseConfig):
                                                     "/mnt/cfs/shanhai/liuh/LTX_VideoInpainting_095/datas/mgtvshow_data.csv"], is_mutable=True)
     mask_csv_file_list: typing.List[str] = field(default=[
                                                     "/mnt/cfs/shanhai/liuh/LTX_VideoInpainting_095/datas/train_mask.csv"], is_mutable=True)
+    mask_video_root: str = field(default="/")
+    mask_csv_file: typing.Optional[str] = field(default=None)  # Single mask CSV file path for random mask selection
     pretrained_model_name_or_path: str = "/mnt/cfs/shanhai/liuh/Wan2.2-TI2V-5B-Diffusers/"
     # Pre-generated data settings
     use_pregenerated_data: bool = field(default=False)  # Use pre-generated mask/ref_image instead of online generation

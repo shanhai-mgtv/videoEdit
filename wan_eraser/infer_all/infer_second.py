@@ -3,13 +3,13 @@ import argparse
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import cv2
 import numpy as np
 import torch.nn.functional as F
 import torchvision.transforms.v2 as transforms
 from transformers import UMT5EncoderModel, AutoTokenizer
 from moviepy import ImageSequenceClip
-from einops import rearrange
 
 from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.transformer_wan import WanTransformer3DModel
@@ -20,7 +20,72 @@ from pipelines.pipeline_wan_inpainting import (
     normalize_latents,
     denormalize_latents,
 )
-from peft import PeftModel
+from safetensors.torch import load_file
+
+
+def merge_lora(transformer, lora_state_dict, alpha=1.0):
+    param_dict = dict(transformer.named_parameters())
+    merged, skipped = [], []
+
+    with torch.no_grad():
+        for key, lora_A in lora_state_dict.items():
+            if not key.endswith("lora_A.weight"):
+                continue
+
+            base_key = key[:-len(".lora_A.weight")]
+            lora_B_key = base_key + ".lora_B.weight"
+
+            if lora_B_key not in lora_state_dict:
+                skipped.append((base_key, "missing B"))
+                continue
+
+            lora_B = lora_state_dict[lora_B_key]
+
+            if base_key == "patch_embedding" or base_key.endswith(".patch_embedding"):
+                target_weight = None
+                for pname, pval in param_dict.items():
+                    if "patch_embedding" in pname and pname.endswith(".weight"):
+                        target_weight = pval
+                        break
+                
+                if target_weight is None:
+                    skipped.append((base_key, "target weight not found"))
+                    continue
+
+                rank = lora_A.shape[0]
+                A_flat = lora_A.flatten(1)  # [rank, in*k*k*k]
+                B_flat = lora_B.view(lora_B.shape[0], lora_B.shape[1])  # [out, rank]
+                update = (B_flat @ A_flat).view_as(target_weight) * (alpha / rank)
+                target_weight.data += update.to(target_weight.device, dtype=target_weight.dtype)
+                merged.append(base_key)
+
+            else:
+                target_key = base_key + ".weight"
+                target_weight = param_dict.get(target_key, None)
+                if target_weight is None:
+                    skipped.append((base_key, "target weight not found"))
+                    continue
+
+                rank = lora_A.shape[0]
+                update = (lora_B @ lora_A) * (alpha / rank)
+                target_weight.data += update.to(target_weight.device, dtype=target_weight.dtype)
+                merged.append(base_key)
+
+    print(f"[SUMMARY] LoRA merge finished.")
+    print(f"  - Merged layers: {len(merged)}")
+    print(f"  - Skipped layers: {len(skipped)}")
+    if merged:
+        print("  ✔ Merged:")
+        for name in merged[:10]:  # 只打印前10个
+            print(f"    {name}")
+        if len(merged) > 10:
+            print(f"    ... and {len(merged) - 10} more")
+    if skipped:
+        print("  ⚠ Skipped:")
+        for name, reason in skipped[:5]:
+            print(f"    {name} ({reason})")
+
+    return transformer
 
 
 def prepare_latents(
@@ -46,7 +111,7 @@ def prepare_latents(
     latents = retrieve_latents(
         latents,
         generator,
-        sample_mode="sample",  # 与训练一致
+        sample_mode="sample",
     )
 
     latents = normalize_latents(
@@ -142,23 +207,6 @@ def expand_mask_to_video(mask_image: np.ndarray, num_frames: int) -> np.ndarray:
     return mask_video
 
 
-def prepare_mask_latent_size(mask_values: torch.Tensor, nframes: int) -> torch.Tensor:
-    latent_masks = rearrange(
-        F.interpolate(mask_values, scale_factor=1/16, mode="nearest-exact"),
-        "(b f) c h w -> b c f h w", f=nframes
-    )
-    
-    first_frame_mask = latent_masks[:, :, 0:1]
-    first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=4)
-    mask_lat_size = torch.concat([first_frame_mask, latent_masks[:, :, 1:, :]], dim=2)
-    
-    batch_size, _, _, latent_height, latent_width = mask_lat_size.shape
-    mask_lat_size = mask_lat_size.view(batch_size, -1, 4, latent_height, latent_width)
-    mask_lat_size = mask_lat_size.transpose(1, 2)
-    
-    return mask_lat_size
-
-
 def infer(
     video_path: str,
     mask_path: str,
@@ -207,11 +255,36 @@ def infer(
         subfolder="transformer",
         torch_dtype=load_dtype,
     )
-    
+
     if lora_path is not None and os.path.exists(lora_path):
+        new_in_channels = 148  
+        initial_input_channels = transformer.config.in_channels
+        
+        new_patch_embedding = nn.Conv3d(
+            new_in_channels,
+            transformer.config.num_attention_heads * transformer.config.attention_head_dim,
+            kernel_size=transformer.config.patch_size,
+            stride=transformer.config.patch_size
+        )
+        with torch.no_grad():
+            new_patch_embedding.weight[:, :initial_input_channels, ...].copy_(transformer.patch_embedding.weight)
+            if transformer.patch_embedding.bias is not None:
+                new_patch_embedding.bias.copy_(transformer.patch_embedding.bias)
+        
+        transformer.patch_embedding = new_patch_embedding.to(dtype=load_dtype)
+        transformer.register_to_config(in_channels=new_in_channels, out_channels=initial_input_channels)
+
         print(f"Loading LoRA weights from {lora_path}")
-        transformer = PeftModel.from_pretrained(transformer, lora_path)
-    
+        adapter_weights_path = os.path.join(lora_path, "adapter_model.safetensors")
+        if os.path.exists(adapter_weights_path):
+            lora_state_dict = load_file(adapter_weights_path)
+            lora_state_dict = {k.replace("base_model.model.", ""): v.to(device=device, dtype=load_dtype) 
+                              for k, v in lora_state_dict.items()}
+            transformer = transformer.to(device=device, dtype=load_dtype)
+            transformer = merge_lora(transformer, lora_state_dict, alpha=1.0)
+        else:
+            print(f"WARNING: adapter_model.safetensors not found at {adapter_weights_path}")
+
     scheduler = FlowMatchScheduler(shift=7, sigma_min=0.0, extra_one_step=True)
     pipeline = WanPipeline(
         tokenizer=tokenizer,
@@ -286,15 +359,26 @@ def infer(
         batch_orig_frames = orig_video[start_idx:end_idx]  # [F, H, W, C]
         batch_orig_mask = orig_mask[start_idx:end_idx]  # [F, 1, H, W]
 
-        # 处理 mask（与训练代码一致）
+        # 处理 mask
         mask_seq = torch.from_numpy(batch_orig_mask).to(device)
         mask_seq = F.interpolate(
             mask_seq.float(), size=(infer_h, infer_w), mode="nearest-exact"
         )
-        mask_seq = mask_seq.to(load_dtype) / 255.0
+        mask_seq = mask_seq.to(torch.float16) / 255.0
 
-        mask_lat_size = prepare_mask_latent_size(mask_seq, infer_len)
-        mask_lat_size = mask_lat_size.to(device=device, dtype=load_dtype)
+        # 处理 mask 到 latent 尺寸
+        first_frame_mask = mask_seq[0:1, :, :]
+        first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=0, repeats=4)
+        mask_lat_size = torch.concat([first_frame_mask, mask_seq[1:, :, :, :]], dim=0)
+        mask_lat_size = F.interpolate(
+            mask_lat_size, scale_factor=1 / 16, mode="nearest-exact"
+        )
+
+        num_frames, _, latent_height, latent_width = mask_lat_size.shape
+        mask_lat_size = mask_lat_size.view(
+            1, num_frames // 4, 4, latent_height, latent_width
+        ) 
+        mask_lat_size = mask_lat_size.transpose(1, 2)  # [B, C, F//4, H, W]
 
         with torch.no_grad():
             with torch.autocast("cuda", dtype=load_dtype):
@@ -374,15 +458,14 @@ def infer(
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
-                    cond_latents=masked_video_latents,
-                    cond_masks=mask_lat_size,
+                    masked_video_latents=masked_video_latents,
+                    mask_lat_size=mask_lat_size,
+                    mask_img_lat_size=mask_img_lat_size,
                     ref_latents=ref_latents,
-                    mask_img_latents=mask_img_lat_size,
                     output_type="latent",
                     strength=strength,
                 ).frames
 
-                # ========== DEBUG: 检查 pipeline 输出 ==========
                 print(f"[DEBUG] gen_latent: shape={gen_latent.shape}, min={gen_latent.min():.4f}, max={gen_latent.max():.4f}, mean={gen_latent.mean():.4f}, std={gen_latent.std():.4f}")
                 
                 with torch.inference_mode():
@@ -407,12 +490,6 @@ def infer(
                 generated_frames += [
                     cv2.resize(video_frame, (W, H)) for video_frame in gen_video
                 ]
-        
-        # 清理显存
-        del mask_seq, mask_lat_size, cond_video, masked_video, masked_video_5d
-        del masked_video_latents, ref_tensor, ref_img_video, ref_latents
-        del ref_mask_tensor, mask_img_lat_size, gen_latent, gen_video
-        torch.cuda.empty_cache()
 
     print("=" * 50)
     print(f"Saving output video to {output_path}...")
@@ -422,7 +499,6 @@ def infer(
     print("Done!")
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="Video inpainting with mask image and reference image")
     # parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/target_video.mp4", help="Input video path")
@@ -430,12 +506,12 @@ def main():
     # parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_image.png", help="Reference image path")
     # parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/out_2.mp4", help="Output video path")
     # parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_masked_image.png", )
-    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/original.mp4", help="Input video path")
-    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/mask.png", help="Mask image path (single image)")
-    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_image_aug.png", help="Reference image path")
-    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/sft_4000steps_cfg3.mp4", help="Output video path")
-    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_mask_aug.png", )
-    parser.add_argument("--prompt", type=str, default="A woman is talking.", help="Prompt for generation")
+    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0002/original.mp4", help="Input video path")
+    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0002/mask.png", help="Mask image path (single image)")
+    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0002/ref_image_aug.png", help="Reference image path")
+    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0002/out_second_lora.mp4", help="Output video path")
+    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0002/ref_mask_aug.png", )
+    parser.add_argument("--prompt", type=str, default="A man is talking.", help="Prompt for generation")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -445,15 +521,14 @@ def main():
     parser.add_argument(
         "--transformer_path",
         type=str,
-        # default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/checkpoint-step00105000",
-        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/sft_1230/sft_1230/checkpoint-step00003800",
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/checkpoint-step00105000",
         help="Transformer weights path",
     )
     parser.add_argument(
         "--lora_path",
         type=str,
-        default = None,
-        # default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00003800/lora_adapter",
+        # default = None,
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/lora_1225_second_ch148_patchembedding/inpaint_lora_v2/checkpoint-step00002400/lora_adapter",
         help="LoRA adapter path (directory containing adapter_model.safetensors and adapter_config.json)",
     )
     parser.add_argument(

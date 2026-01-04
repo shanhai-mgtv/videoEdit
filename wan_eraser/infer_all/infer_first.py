@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import torchvision.transforms.v2 as transforms
 from transformers import UMT5EncoderModel, AutoTokenizer
 from moviepy import ImageSequenceClip
-from einops import rearrange
 
 from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.transformer_wan import WanTransformer3DModel
@@ -142,23 +141,6 @@ def expand_mask_to_video(mask_image: np.ndarray, num_frames: int) -> np.ndarray:
     return mask_video
 
 
-def prepare_mask_latent_size(mask_values: torch.Tensor, nframes: int) -> torch.Tensor:
-    latent_masks = rearrange(
-        F.interpolate(mask_values, scale_factor=1/16, mode="nearest-exact"),
-        "(b f) c h w -> b c f h w", f=nframes
-    )
-    
-    first_frame_mask = latent_masks[:, :, 0:1]
-    first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=4)
-    mask_lat_size = torch.concat([first_frame_mask, latent_masks[:, :, 1:, :]], dim=2)
-    
-    batch_size, _, _, latent_height, latent_width = mask_lat_size.shape
-    mask_lat_size = mask_lat_size.view(batch_size, -1, 4, latent_height, latent_width)
-    mask_lat_size = mask_lat_size.transpose(1, 2)
-    
-    return mask_lat_size
-
-
 def infer(
     video_path: str,
     mask_path: str,
@@ -286,15 +268,26 @@ def infer(
         batch_orig_frames = orig_video[start_idx:end_idx]  # [F, H, W, C]
         batch_orig_mask = orig_mask[start_idx:end_idx]  # [F, 1, H, W]
 
-        # 处理 mask（与训练代码一致）
+        # 处理 mask
         mask_seq = torch.from_numpy(batch_orig_mask).to(device)
         mask_seq = F.interpolate(
             mask_seq.float(), size=(infer_h, infer_w), mode="nearest-exact"
         )
-        mask_seq = mask_seq.to(load_dtype) / 255.0
+        mask_seq = mask_seq.to(torch.float16) / 255.0
 
-        mask_lat_size = prepare_mask_latent_size(mask_seq, infer_len)
-        mask_lat_size = mask_lat_size.to(device=device, dtype=load_dtype)
+        # 处理 mask 到 latent 尺寸
+        first_frame_mask = mask_seq[0:1, :, :]
+        first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=0, repeats=4)
+        mask_lat_size = torch.concat([first_frame_mask, mask_seq[1:, :, :, :]], dim=0)
+        mask_lat_size = F.interpolate(
+            mask_lat_size, scale_factor=1 / 16, mode="nearest-exact"
+        )
+
+        num_frames, _, latent_height, latent_width = mask_lat_size.shape
+        mask_lat_size = mask_lat_size.view(
+            1, num_frames // 4, 4, latent_height, latent_width
+        ) 
+        mask_lat_size = mask_lat_size.transpose(1, 2)  # [B, C, F//4, H, W]
 
         with torch.no_grad():
             with torch.autocast("cuda", dtype=load_dtype):
@@ -407,12 +400,6 @@ def infer(
                 generated_frames += [
                     cv2.resize(video_frame, (W, H)) for video_frame in gen_video
                 ]
-        
-        # 清理显存
-        del mask_seq, mask_lat_size, cond_video, masked_video, masked_video_5d
-        del masked_video_latents, ref_tensor, ref_img_video, ref_latents
-        del ref_mask_tensor, mask_img_lat_size, gen_latent, gen_video
-        torch.cuda.empty_cache()
 
     print("=" * 50)
     print(f"Saving output video to {output_path}...")
@@ -422,7 +409,6 @@ def infer(
     print("Done!")
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="Video inpainting with mask image and reference image")
     # parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/target_video.mp4", help="Input video path")
@@ -430,12 +416,12 @@ def main():
     # parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_image.png", help="Reference image path")
     # parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/out_2.mp4", help="Output video path")
     # parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_masked_image.png", )
-    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/original.mp4", help="Input video path")
-    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/mask.png", help="Mask image path (single image)")
-    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_image_aug.png", help="Reference image path")
-    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/sft_4000steps_cfg3.mp4", help="Output video path")
-    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_mask_aug.png", )
-    parser.add_argument("--prompt", type=str, default="A woman is talking.", help="Prompt for generation")
+    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/original.mp4", help="Input video path")
+    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/mask.png", help="Mask image path (single image)")
+    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/ref_image_aug.png", help="Reference image path")
+    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/out_0002_argmax_refnorm_again.mp4", help="Output video path")
+    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/ref_mask_aug.png", )
+    parser.add_argument("--prompt", type=str, default="A man is talking.", help="Prompt for generation")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -445,15 +431,14 @@ def main():
     parser.add_argument(
         "--transformer_path",
         type=str,
-        # default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/checkpoint-step00105000",
-        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/sft_1230/sft_1230/checkpoint-step00003800",
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/checkpoint-step00105000",
         help="Transformer weights path",
     )
     parser.add_argument(
         "--lora_path",
         type=str,
-        default = None,
-        # default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00003800/lora_adapter",
+        # default = None,
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002800/lora_adapter",
         help="LoRA adapter path (directory containing adapter_model.safetensors and adapter_config.json)",
     )
     parser.add_argument(

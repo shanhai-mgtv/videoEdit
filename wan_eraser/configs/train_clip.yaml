@@ -1,10 +1,10 @@
 experiment:
-  output_dirpath: "./outputs/sft_1230/"
+  output_dirpath: "./outputs/clip_training/"
   random_seed: 42
-  run_id: "sft_1230"
-  name: "video_editing"
+  run_id: "clip_sft_training"
+  name: "video_editing_clip"
   ic_debug: false
-  use_lora: false 
+  use_lora: false
   validation_prompts:
     - - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495.mp4"
       - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495_mask.mp4"
@@ -16,17 +16,18 @@ experiment:
 data:
   batch_size: 1
   nframes: 81
-  data_root: "/mnt/cfs/shanhai/liuh/datasets/raw_data/"
-  mask_csv_file: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/mask_paths.csv"
+  data_root: "/"
   csv_file_list:
-    - "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/train_data_filtered_by_sft.csv" 
-  mask_csv_file_list: [] 
+    - "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/train_data_filtered_by_sft.csv"
+  mask_csv_file_list: []
+  mask_video_root: "/"
+  mask_csv_file: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/mask_paths.csv"
   dataloader_kwargs:
     drop_last: true
-    num_workers: 1
-    persistent_workers: false  
-    pin_memory: false  
-    prefetch_factor: 1
+    num_workers: 4
+    persistent_workers: false
+    pin_memory: true
+    prefetch_factor: 2
 
 model:
   pretrained_model_name_or_path: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/base"
@@ -51,7 +52,7 @@ hparams:
   mixed_precision: "bf16"
   gradient_checkpointing: true
   gradient_accumulation_steps: 1
-  learning_rate: 2.0e-06
+  learning_rate: 2.0e-05
   optimizer_type: "optimi-stableadamw"
   optimizer_args:
     - "weight_decay=1e-2"
@@ -86,10 +87,10 @@ hparams:
     ema_update_interval: null
 
 checkpointing:
-  save_every_n_steps: 100
-  save_last_n_steps: 100000
-  resume_from_checkpoint: /mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/sft_1230/sft_1230/checkpoint-step00003800
-  resume_from_lora_checkpoint: null 
+  save_every_n_steps: 1000
+  save_last_n_steps: 10000
+  resume_from_checkpoint: null
+  resume_from_lora_checkpoint: null
 
 ddp_kwargs:
   backend: "nccl"

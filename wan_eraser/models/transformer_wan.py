@@ -636,18 +636,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: [B, seq_len, dim]
-            encoder_hidden_states: text embeddings for cross-attention
-            temb: timestep embeddings
-            rotary_emb: rotary position embeddings
-            attention_mask: Optional attention mask for self-attention [B, 1, seq_len, seq_len]
-                           Used to mask reference background tokens.
-                           0 = attend, -inf = mask out
-        """
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -666,9 +655,9 @@ class WanTransformerBlock(nn.Module):
                 self.scale_shift_table + temb.float()
             ).chunk(6, dim=1)
 
-        # 1. Self-attention with optional mask for reference tokens
+        # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, attention_mask, rotary_emb)
+        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -804,8 +793,6 @@ class WanTransformer3DModel(
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         frame_segments: Optional[List[Tuple[int, bool]]] = None,
-        ref_token_mask: Optional[torch.Tensor] = None,
-        video_token_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
@@ -821,13 +808,6 @@ class WanTransformer3DModel(
                            - 21 frames: target video (positive indices 0-20)
                            - 21 frames: masked video (positive indices 0-20)
                            - 1 frame: reference image (negative index -1)
-            ref_token_mask: Optional mask for reference tokens [B, num_ref_tokens]
-                           1 = foreground (can interact), 0 = background (masked out)
-                           Used to mask out background tokens in reference frame.
-            video_token_mask: Optional mask for video tokens [B, num_video_tokens_per_branch, num_branches]
-                           or [B, num_noisy_tokens, num_masked_tokens]
-                           1 = visible region (can interact), 0 = masked region (masked out)
-                           Used to mask out occluded tokens in masked_video branch.
         """
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -879,59 +859,15 @@ class WanTransformer3DModel(
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-        # Build attention mask for reference and video token masking
-        # ref_token_mask: [B, num_ref_tokens], 1=foreground, 0=background
-        attention_mask = None
-        if ref_token_mask is not None or video_token_mask is not None:
-            seq_len = hidden_states.shape[1]
-            attn_mask = torch.zeros(batch_size, seq_len, seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
-            
-            # Apply ref_token_mask: bidirectional masking for background ref tokens
-            # Paper Figure 3: 背景ref token既不被关注（列mask），也不关注其他token（行mask）
-            if ref_token_mask is not None:
-                num_ref_tokens = ref_token_mask.shape[1]
-                num_video_tokens = seq_len - num_ref_tokens
-                
-                # 列屏蔽：其他token不能attend到ref背景token
-                # attn_mask[:, :, num_video_tokens:]: shape [B, seq_len, num_ref_tokens]
-                ref_mask_col = ref_token_mask.unsqueeze(1).expand(-1, seq_len, -1)  # [B, seq_len, num_ref_tokens]
-                attn_mask[:, :, num_video_tokens:] = torch.where(
-                    ref_mask_col > 0.5,
-                    torch.zeros_like(ref_mask_col),
-                    torch.full_like(ref_mask_col, float('-inf'))
-                )
-                
-                # 行屏蔽：ref背景token不能attend到任何token
-                # attn_mask[:, num_video_tokens:, :]: shape [B, num_ref_tokens, seq_len]
-                ref_mask_row = ref_token_mask.unsqueeze(2).expand(-1, -1, seq_len)  # [B, num_ref_tokens, seq_len]
-                attn_mask[:, num_video_tokens:, :] = torch.where(
-                    ref_mask_row > 0.5,
-                    attn_mask[:, num_video_tokens:, :].clone(), 
-                    torch.full_like(ref_mask_row, float('-inf'))
-                )
-            
-            if video_token_mask is not None:
-                num_tokens_per_branch = video_token_mask.shape[1]
-                start_idx = num_tokens_per_branch
-                end_idx = 2 * num_tokens_per_branch
-                video_mask_expanded = video_token_mask.unsqueeze(1).expand(-1, seq_len, -1)
-                attn_mask[:, :, start_idx:end_idx] = torch.where(
-                    video_mask_expanded > 0.5,
-                    attn_mask[:, :, start_idx:end_idx].clone(), 
-                    torch.full_like(video_mask_expanded, float('-inf'))
-                )
-
-            attention_mask = attn_mask.unsqueeze(1)
-
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_mask
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_mask)
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:

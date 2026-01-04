@@ -1,10 +1,10 @@
 experiment:
-  output_dirpath: "./outputs/inpaint_lora_1222_change_the_refmask/"
+  output_dirpath: "./outputs/lora_1229_first_norope/"
   random_seed: 42
-  run_id: "inpaint_lora_v1"
-  name: "video_inpainting"
+  run_id: "inpaint_lora_toqkv"
+  name: "video_editing"
   ic_debug: false
-  use_lora: true  # 启用 LoRA 微调
+  use_lora: true 
   validation_prompts:
     - - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495.mp4"
       - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495_mask.mp4"
@@ -86,12 +86,12 @@ hparams:
 
 checkpointing:
   save_every_n_steps: 100
-  save_last_n_steps: 1000
-  resume_from_checkpoint: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/checkpoint-step00002800"
+  save_last_n_steps: 1000000000
+  resume_from_checkpoint: 
   resume_from_lora_checkpoint: null 
 
 ddp_kwargs:
   backend: "nccl"
-  find_unused_parameters: false
+  find_unused_parameters: true
   gradient_as_bucket_view: false
   static_graph: false

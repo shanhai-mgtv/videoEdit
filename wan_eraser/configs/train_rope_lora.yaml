@@ -1,10 +1,13 @@
+# Training config for train_wan_sft_rope.py
+# Key difference: Reference frame RoPE position is FIXED at index 60
+
 experiment:
-  output_dirpath: "./outputs/sft_1230/"
-  random_seed: 42
-  run_id: "sft_1230"
-  name: "video_editing"
+  output_dirpath: "./outputs/lora_rope_fixed60/"
+  random_seed: 1234
+  run_id: "inpaint_lora_rope"
+  name: "video_editing_rope"
   ic_debug: false
-  use_lora: false 
+  use_lora: true 
   validation_prompts:
     - - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495.mp4"
       - "/mnt/cfs/shanhai/wangsiyuan/wan_eraser/data/10041495_mask.mp4"
@@ -17,9 +20,8 @@ data:
   batch_size: 1
   nframes: 81
   data_root: "/mnt/cfs/shanhai/liuh/datasets/raw_data/"
-  mask_csv_file: "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/mask_paths.csv"
   csv_file_list:
-    - "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/train_data_filtered_by_sft.csv" 
+    - "/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/train_data_filtered.csv" 
   mask_csv_file_list: [] 
   dataloader_kwargs:
     drop_last: true
@@ -51,7 +53,7 @@ hparams:
   mixed_precision: "bf16"
   gradient_checkpointing: true
   gradient_accumulation_steps: 1
-  learning_rate: 2.0e-06
+  learning_rate: 2.0e-05
   optimizer_type: "optimi-stableadamw"
   optimizer_args:
     - "weight_decay=1e-2"
@@ -86,9 +88,9 @@ hparams:
     ema_update_interval: null
 
 checkpointing:
-  save_every_n_steps: 100
-  save_last_n_steps: 100000
-  resume_from_checkpoint: /mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/sft_1230/sft_1230/checkpoint-step00003800
+  save_every_n_steps: 200
+  save_last_n_steps: 1000000000
+  resume_from_checkpoint: 
   resume_from_lora_checkpoint: null 
 
 ddp_kwargs:
