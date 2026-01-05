@@ -831,7 +831,7 @@ class WanTransformer3DModel(
         post_patch_width = width // p_w
 
         # Compute RoPE with optional frame_segments for reference frame distinction
-        if self.config.use_ref_frame_rope and frame_segments is not None:
+        if self.use_ref_frame_rope and frame_segments is not None:
             rotary_emb = self.rope(hidden_states, frame_segments=frame_segments)
         else:
             rotary_emb = self.rope(hidden_states)

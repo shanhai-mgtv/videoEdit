@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import torchvision.transforms.v2 as transforms
 from transformers import UMT5EncoderModel, AutoTokenizer
 from moviepy import ImageSequenceClip
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 
 # Add parent directory to path for imports
@@ -33,79 +34,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.transformer_wan_rope import WanTransformer3DModelFixedRef
 from models.flow_match import FlowMatchScheduler
+
 from pipelines.pipeline_wan_inpainting_fixed_ref import (
     WanPipelineFixedRef,
     retrieve_latents,
     normalize_latents,
     denormalize_latents,
 )
-
-
-def merge_lora(transformer, lora_state_dict, alpha=1.0):
-    """Merge LoRA weights into transformer model."""
-    param_dict = dict(transformer.named_parameters())
-    merged, skipped = [], []
-
-    with torch.no_grad():
-        for key, lora_A in lora_state_dict.items():
-            if not key.endswith("lora_A.weight"):
-                continue
-
-            base_key = key[:-len(".lora_A.weight")]
-            lora_B_key = base_key + ".lora_B.weight"
-
-            if lora_B_key not in lora_state_dict:
-                skipped.append((base_key, "missing B"))
-                continue
-
-            lora_B = lora_state_dict[lora_B_key]
-
-            if base_key == "patch_embedding" or base_key.endswith(".patch_embedding"):
-                target_weight = None
-                for pname, pval in param_dict.items():
-                    if "patch_embedding" in pname and pname.endswith(".weight"):
-                        target_weight = pval
-                        break
-                
-                if target_weight is None:
-                    skipped.append((base_key, "target weight not found"))
-                    continue
-
-                rank = lora_A.shape[0]
-                A_flat = lora_A.flatten(1)  # [rank, in*k*k*k]
-                B_flat = lora_B.view(lora_B.shape[0], lora_B.shape[1])  # [out, rank]
-                update = (B_flat @ A_flat).view_as(target_weight) * (alpha / rank)
-                target_weight.data += update.to(target_weight.device, dtype=target_weight.dtype)
-                merged.append(base_key)
-
-            else:
-                target_key = base_key + ".weight"
-                target_weight = param_dict.get(target_key, None)
-                if target_weight is None:
-                    skipped.append((base_key, "target weight not found"))
-                    continue
-
-                rank = lora_A.shape[0]
-                update = (lora_B @ lora_A) * (alpha / rank)
-                target_weight.data += update.to(target_weight.device, dtype=target_weight.dtype)
-                merged.append(base_key)
-
-    print(f"[SUMMARY] LoRA merge finished.")
-    print(f"  - Merged layers: {len(merged)}")
-    print(f"  - Skipped layers: {len(skipped)}")
-    if merged:
-        print("  ✔ Merged:")
-        for name in merged[:10]:
-            print(f"    {name}")
-        if len(merged) > 10:
-            print(f"    ... and {len(merged) - 10} more")
-    if skipped:
-        print("  ⚠ Skipped:")
-        for name, reason in skipped[:5]:
-            print(f"    {name} ({reason})")
-
-    return transformer
-
 
 def prepare_latents(
     vae: AutoencoderKLWan,
@@ -265,33 +200,37 @@ def infer(
 
     # Handle LoRA weights if provided
     if lora_path is not None and os.path.exists(lora_path):
-        new_in_channels = 148  
-        initial_input_channels = transformer.config.in_channels
-        
-        new_patch_embedding = nn.Conv3d(
-            new_in_channels,
-            transformer.config.num_attention_heads * transformer.config.attention_head_dim,
-            kernel_size=transformer.config.patch_size,
-            stride=transformer.config.patch_size
-        )
-        with torch.no_grad():
-            new_patch_embedding.weight[:, :initial_input_channels, ...].copy_(transformer.patch_embedding.weight)
-            if transformer.patch_embedding.bias is not None:
-                new_patch_embedding.bias.copy_(transformer.patch_embedding.bias)
-        
-        transformer.patch_embedding = new_patch_embedding.to(dtype=load_dtype)
-        transformer.register_to_config(in_channels=new_in_channels, out_channels=initial_input_channels)
-
-        print(f"Loading LoRA weights from {lora_path}")
-        adapter_weights_path = os.path.join(lora_path, "adapter_model.safetensors")
-        if os.path.exists(adapter_weights_path):
-            lora_state_dict = load_file(adapter_weights_path)
-            lora_state_dict = {k.replace("base_model.model.", ""): v.to(device=device, dtype=load_dtype) 
-                              for k, v in lora_state_dict.items()}
-            transformer = transformer.to(device=device, dtype=load_dtype)
-            transformer = merge_lora(transformer, lora_state_dict, alpha=1.0)
+        # Find the safetensors file
+        if os.path.isdir(lora_path):
+            # Look for .safetensors file in the directory
+            safetensor_files = [f for f in os.listdir(lora_path) if f.endswith('.safetensors')]
+            if not safetensor_files:
+                raise ValueError(f"No .safetensors file found in {lora_path}")
+            lora_weights_path = os.path.join(lora_path, safetensor_files[0])
         else:
-            print(f"WARNING: adapter_model.safetensors not found at {adapter_weights_path}")
+            lora_weights_path = lora_path
+        
+        print(f"Loading LoRA weights from {lora_weights_path}")
+        
+        lora_config = LoraConfig(
+            r=128,
+            lora_alpha=128,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            lora_dropout=0.0,
+        )
+        transformer = get_peft_model(transformer, lora_config)
+        lora_state_dict = load_file(lora_weights_path)
+        fixed_state_dict = {}
+        for key, value in lora_state_dict.items():
+            if key.startswith("transformer."):
+                new_key = key[len("transformer."):]
+                fixed_state_dict[new_key] = value
+            else:
+                fixed_state_dict[key] = value
+        
+        print(f"Fixed {len(fixed_state_dict)} keys (removed 'transformer.' prefix)")
+        set_peft_model_state_dict(transformer, fixed_state_dict)
+        print(f"LoRA weights loaded successfully")
 
     # Create pipeline with fixed ref RoPE
     scheduler = FlowMatchScheduler(shift=7, sigma_min=0.0, extra_one_step=True)
@@ -412,7 +351,7 @@ def infer(
                     ref_img_video = ref_tensor.unsqueeze(2)
                     ref_latents = prepare_latents(vae, ref_img_video)
                     ref_latents = ref_latents.to(dtype=load_dtype)
-                    
+
                     # Prepare ref_mask
                     if ref_mask is not None:
                         ref_mask_tensor = torch.from_numpy(ref_mask).float().unsqueeze(0).unsqueeze(0)
@@ -474,12 +413,18 @@ def infer(
 def main():
     parser = argparse.ArgumentParser(description="Video inpainting with FIXED reference frame RoPE position at 60")
     
-    parser.add_argument("--video_path", type=str, required=True, help="Input video path")
-    parser.add_argument("--mask_path", type=str, required=True, help="Mask image path (single image)")
-    parser.add_argument("--ref_path", type=str, required=True, help="Reference image path")
-    parser.add_argument("--output_path", type=str, required=True, help="Output video path")
-    parser.add_argument("--ref_mask_path", type=str, default=None, help="Reference mask path (optional)")
-    parser.add_argument("--prompt", type=str, default="", help="Prompt for generation")
+    # Batch mode: process all demos in validation_demo directory
+    parser.add_argument("--batch_mode", action="store_true", help="Process all demos in validation_demo directory")
+    parser.add_argument("--demo_dir", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo", help="Directory containing demo folders")
+    parser.add_argument("--output_suffix", type=str, default="rope_1800steps", help="Suffix for output video filename in batch mode")
+    
+    # Single mode arguments
+    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/original.mp4", help="Input video path")
+    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/mask.png", help="Mask image path (single image)")
+    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_image_aug.png", help="Reference image path")
+    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/rope_600steps.mp4", help="Output video path")
+    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0004/ref_mask_aug.png", )
+    parser.add_argument("--prompt", type=str, default="A woman is talking.", help="Prompt for generation")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -495,8 +440,7 @@ def main():
     parser.add_argument(
         "--lora_path",
         type=str,
-        default=None,
-        help="LoRA adapter path (directory containing adapter_model.safetensors)",
+        default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/lora_rope_fixed60/inpaint_lora_rope/checkpoint-step00001800",
     )
     parser.add_argument(
         "--negative_prompt",
@@ -515,26 +459,110 @@ def main():
 
     args = parser.parse_args()
 
-    infer(
-        video_path=args.video_path,
-        mask_path=args.mask_path,
-        ref_path=args.ref_path,
-        output_path=args.output_path,
-        model_path=args.model_path,
-        transformer_path=args.transformer_path,
-        lora_path=args.lora_path,
-        ref_mask_path=args.ref_mask_path,
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        infer_h=args.infer_h,
-        infer_w=args.infer_w,
-        infer_len=args.infer_len,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        strength=args.strength,
-        seed=args.seed,
-        device=args.device,
-    )
+    if args.batch_mode:
+        # Batch mode: process all sample_* directories in demo_dir
+        demo_dirs = sorted([
+            d for d in os.listdir(args.demo_dir) 
+            if os.path.isdir(os.path.join(args.demo_dir, d)) and d.startswith("sample_")
+        ])
+        
+        print("=" * 60)
+        print(f"BATCH MODE: Found {len(demo_dirs)} demos to process")
+        print("=" * 60)
+        
+        for i, demo_name in enumerate(demo_dirs):
+            demo_path = os.path.join(args.demo_dir, demo_name)
+            
+            video_path = os.path.join(demo_path, "original.mp4")
+            mask_path = os.path.join(demo_path, "mask.png")
+            ref_path = os.path.join(demo_path, "ref_image_aug.png")
+            ref_mask_path = os.path.join(demo_path, "ref_mask_aug.png")
+            output_path = os.path.join(demo_path, f"{args.output_suffix}.mp4")
+            
+            caption_path = os.path.join(demo_path, "caption.txt")
+            if os.path.exists(caption_path):
+                with open(caption_path, "r") as f:
+                    prompt = f.read().strip()
+                if not prompt:
+                    prompt = args.prompt
+            else:
+                prompt = args.prompt
+            
+            if not os.path.exists(video_path):
+                print(f"[{i+1}/{len(demo_dirs)}] Skipping {demo_name}: original.mp4 not found")
+                continue
+            if not os.path.exists(mask_path):
+                print(f"[{i+1}/{len(demo_dirs)}] Skipping {demo_name}: mask.png not found")
+                continue
+            if not os.path.exists(ref_path):
+                # Try ref_image.png as fallback
+                ref_path_fallback = os.path.join(demo_path, "ref_image.png")
+                if os.path.exists(ref_path_fallback):
+                    ref_path = ref_path_fallback
+                else:
+                    print(f"[{i+1}/{len(demo_dirs)}] Skipping {demo_name}: ref_image not found")
+                    continue
+            
+            # ref_mask is optional
+            if not os.path.exists(ref_mask_path):
+                ref_mask_path = None
+            
+            print("\n" + "=" * 60)
+            print(f"[{i+1}/{len(demo_dirs)}] Processing: {demo_name}")
+            print(f"  Video: {video_path}")
+            print(f"  Output: {output_path}")
+            print("=" * 60)
+            
+            try:
+                infer(
+                    video_path=video_path,
+                    mask_path=mask_path,
+                    ref_path=ref_path,
+                    output_path=output_path,
+                    model_path=args.model_path,
+                    transformer_path=args.transformer_path,
+                    lora_path=args.lora_path,
+                    ref_mask_path=ref_mask_path,
+                    prompt=prompt,
+                    negative_prompt=args.negative_prompt,
+                    infer_h=args.infer_h,
+                    infer_w=args.infer_w,
+                    infer_len=args.infer_len,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    strength=args.strength,
+                    seed=args.seed,
+                    device=args.device,
+                )
+            except Exception as e:
+                print(f"[{i+1}/{len(demo_dirs)}] Error processing {demo_name}: {e}")
+                continue
+        
+        print("\n" + "=" * 60)
+        print("BATCH MODE COMPLETED")
+        print("=" * 60)
+    else:
+        # Single mode
+        infer(
+            video_path=args.video_path,
+            mask_path=args.mask_path,
+            ref_path=args.ref_path,
+            output_path=args.output_path,
+            model_path=args.model_path,
+            transformer_path=args.transformer_path,
+            lora_path=args.lora_path,
+            ref_mask_path=args.ref_mask_path,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            infer_h=args.infer_h,
+            infer_w=args.infer_w,
+            infer_len=args.infer_len,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            strength=args.strength,
+            seed=args.seed,
+            device=args.device,
+        )
 
 
 if __name__ == "__main__":

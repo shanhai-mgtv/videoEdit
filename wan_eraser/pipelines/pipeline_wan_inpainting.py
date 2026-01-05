@@ -34,6 +34,8 @@ from diffusers.pipelines.wan.pipeline_output import WanPipelineOutput
 
 from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.transformer_wan import WanTransformer3DModel
+# from models.transformer_wan_rope import WanTransformer3DModelFixedRef as WanTransformer3DModel
+
 from models.flow_match import FlowMatchScheduler
 
 if is_torch_xla_available():
@@ -96,22 +98,6 @@ def whitespace_clean(text):
 def prompt_clean(text):
     text = whitespace_clean(basic_clean(text))
     return text
-
-
-# offcial diffusers
-"""
-def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-"""
 
 
 def retrieve_latents(

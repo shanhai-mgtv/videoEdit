@@ -550,55 +550,18 @@ def main(cfg: Config):
         logger.info("Setting up LoRA fine-tuning...")
         transformer.requires_grad_(False)  # Freeze base model first
         
-        # Configure target modules (similar to test/train.py)
-        if hasattr(cfg.network, 'lora_layers') and cfg.network.lora_layers is not None:
-            if cfg.network.lora_layers != "all-linear":
-                target_modules = [layer.strip() for layer in cfg.network.lora_layers.split(",")]
-                if "patch_embedding" not in target_modules:
-                    target_modules.append("patch_embedding")
-            else:
-                # 匹配: to_q, to_k, to_v, to_out.0
-                core_proj_pattern = re.compile(r".*\.(to_q|to_k|to_v|to_out\.0)$")
-                target_modules = []
-                for name, module in transformer.named_modules():
-                    if isinstance(module, torch.nn.Linear):
-                        if core_proj_pattern.match(name):
-                            target_modules.append(name)
-                for name, module in transformer.named_modules():
-                    if name.endswith("patch_embedding") and name not in target_modules:
-                        target_modules.append(name)
-                target_modules = list(dict.fromkeys(target_modules))
-                target_modules = [t for t in target_modules if "norm" not in t]
-        else:
-            assert cfg.network.target_modules is not None, "either `lora_layers` or `target_modules` must be specified"
-            target_modules = list(cfg.network.target_modules)
-            if "patch_embedding" not in target_modules:
-                target_modules.append("patch_embedding")
-        
-        logger.info(f"using LoRA training mode:")
-        logger.info(f"rank ................................. {cfg.network.lora_rank!r}")
-        logger.info(f"alpha ................................ {cfg.network.lora_alpha!r}")
-        logger.info(f"target_modules ....................... {json.dumps(target_modules, indent=4)}")
-        
-        transformer_lora_config = LoraConfig(
+        # Configure LoRA
+        lora_config = LoraConfig(
             r=cfg.network.lora_rank,
             lora_alpha=cfg.network.lora_alpha,
+            target_modules=cfg.network.target_modules or ["to_q", "to_k", "to_v", "to_out.0"],
             lora_dropout=cfg.network.lora_dropout,
-            target_modules=target_modules,
             init_lora_weights=cfg.network.init_lora_weights,
         )
-        transformer.add_adapter(transformer_lora_config)
-        accelerator.wait_for_everyone()
         
-        # Optional: train norm layers
-        if hasattr(cfg.network, 'train_norm_layers') and cfg.network.train_norm_layers:
-            train_norm_layers = []
-            logger.info(f"train norm layers, setting requires_grad to True for layers matching {NORM_LAYER_PREFIXES!r}")
-            for name, param in transformer.named_parameters():
-                if any(k in name for k in NORM_LAYER_PREFIXES):
-                    param.requires_grad_(True)
-                    train_norm_layers.append(name)
-            logger.info(f"train norm layers .................... {json.dumps(train_norm_layers, indent=4)}")
+        transformer = get_peft_model(transformer, lora_config)
+        logger.info(f"LoRA config: rank={cfg.network.lora_rank}, alpha={cfg.network.lora_alpha}")
+        transformer.print_trainable_parameters()
         
         # Load from existing LoRA checkpoint if specified
         if cfg.checkpointing.resume_from_lora_checkpoint:
@@ -773,17 +736,18 @@ def main(cfg: Config):
                 logger.error(f"Could not load EMA model: {e!r}")
 
         if cfg.experiment.use_lora:
-            # For LoRA, load adapter weights (包含 modules_to_save 中的 patch_embedding)
-            lora_path = os.path.join(input_dir, "lora_adapter")
+            # Load from single safetensors file saved by save_model_hook
+            lora_weights_path = os.path.join(input_dir, f"{cfg.experiment.run_id}.safetensors")
             
-            if os.path.exists(lora_path):
-                logger.info(f"Loading LoRA adapter from {lora_path}")
+            if os.path.exists(lora_weights_path):
+                logger.info(f"Loading LoRA weights from {lora_weights_path}")
+                from safetensors.torch import load_file
+                lora_state_dict = load_file(lora_weights_path)
                 while len(models) > 0:
                     model = models.pop()
-                    if hasattr(model, 'load_adapter'):
-                        model.load_adapter(lora_path, adapter_name="default")
+                    set_peft_model_state_dict(model, lora_state_dict)
             else:
-                logger.warning(f"LoRA adapter not found at {lora_path}, skipping load")
+                logger.warning(f"LoRA weights not found at {lora_weights_path}, skipping load")
                 while len(models) > 0:
                     models.pop()
         else:
@@ -1094,12 +1058,12 @@ def main(cfg: Config):
                 noisy_model_input = noise_scheduler.add_noise(latents, noise, timestep)
                 training_target = noise_scheduler.training_target(latents, noise, timestep)
                 
-                zeros_latents = torch.zeros_like(latents)  # [B, 16, F, h, w]
+                zeros_latents = torch.zeros_like(latents)  # [B, 48, F, h, w]
                 zeros_latents_4ch = torch.zeros_like(mask_lat_size)  # [B, 4, F, h, w]
 
                 # ============================================
                 # Three-branch temporal fusion + channel fusion
-                # Same structure as train_wan_sft_inpaint.py
+                # 100-channel structure (48 + 4 + 48 = 100)
                 # ============================================
                 
                 # Runtime shape validation before concatenation
@@ -1123,16 +1087,6 @@ def main(cfg: Config):
                 branch1 = torch.cat([noisy_model_input, masked_video_latents, ref_latents], dim=2)  # [B, 16, 2F+1, h, w]
                 branch2 = torch.cat([zeros_latents_4ch, mask_lat_size, mask_img_lat_size], dim=2)   # [B, 4, 2F+1, h, w]
                 branch3 = torch.cat([zeros_latents, masked_video_latents, ref_latents], dim=2)      # [B, 16, 2F+1, h, w]
-                
-                # Verify branch temporal dimensions
-                assert branch1.shape[2] == expected_temporal_frames, \
-                    f"branch1 temporal dim: {branch1.shape[2]} vs expected {expected_temporal_frames}"
-                assert branch2.shape[2] == expected_temporal_frames, \
-                    f"branch2 temporal dim: {branch2.shape[2]} vs expected {expected_temporal_frames}"
-                assert branch3.shape[2] == expected_temporal_frames, \
-                    f"branch3 temporal dim: {branch3.shape[2]} vs expected {expected_temporal_frames}"
-                
-                # [B, 16, 2F+1, H, W] + [B, 4, 2F+1, H, W] + [B, 16, 2F+1, H, W] -> [B, 36, 2F+1, H, W]
                 model_input = torch.cat([branch1, branch2, branch3], dim=1)
                 
                 # Release intermediate tensors to free memory
@@ -1143,12 +1097,8 @@ def main(cfg: Config):
                     logger.info(f"Model input shape: {model_input.shape}")
                     logger.info(f"Expected: [B, 36, {expected_temporal_frames}, H, W]")
 
-                num_latent_frames = latents.shape[2]  # F (latent frames)
-                ref_num_frames = ref_latents.shape[2]  # 1 (reference image)
-                # frame_segments for FIXED ref position at 60:
-                # - noisy_gt: sequential indices 0 to F-1
-                # - masked_video: sequential indices F to 2F-1  
-                # - ref_img: FIXED position 60 (is_reference=True)
+                num_latent_frames = latents.shape[2]
+                ref_num_frames = ref_latents.shape[2]
                 frame_segments = [
                     (num_latent_frames, False),   # noisy_gt: sequential indices 0 to F-1
                     (num_latent_frames, False),   # masked_video: sequential indices F to 2F-1

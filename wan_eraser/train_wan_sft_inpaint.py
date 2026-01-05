@@ -62,7 +62,6 @@ from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.flow_match import FlowMatchScheduler
 from pipelines.pipeline_wan_inpainting import WanPipeline, retrieve_latents, prompt_clean
 from ema import EMAModel
-# from utils_inference.video_writer import TensorSaveVideo
 
 
 logging.basicConfig(
@@ -555,7 +554,7 @@ def channel_fusion(
         branch1_out: [B, C1, F, H, W] output from branch 1
         branch2_out: [B, C2, F, H, W] output from branch 2
         branch3_out: [B, C3, F, H, W] output from branch 3
-        
+
     Returns:
         fused: [B, C1+C2+C3, F, H, W] channel-fused features
     """
@@ -687,21 +686,10 @@ def main(cfg: Config):
         torch_dtype=load_dtype,
     )
     
-    # =====================================================================
-    # Three-branch fusion architecture:
-    # - 时序拼接 (Temporal concat, dim=2): 每个分支内部 [gt, video1, video2] concat along F
-    # - 通道融合 (Channel concat, dim=1): 三个分支 concat along C
-    # 
-    # Branch 1: [noisy_gt, masked_video, ref] → temporal concat → [B, 16, 2f+1, H, W]
-    # Branch 2: [zeros,    mask_video,   mask_img] → temporal concat → [B, 4, 2f+1, H, W]
-    # Branch 3: [zeros,    masked_video, ref] → temporal concat → [B, 16, 2f+1, H, W]
-    # 
-    # Final: channel concat → [B, 34, 2f+1, H, W]
-    # =====================================================================
     
     with torch.no_grad():
         logger.info("Expanding transformer input channels for three-branch temporal+channel fusion")
-        initial_input_channels = transformer.config.in_channels  # 16
+        initial_input_channels = transformer.config.in_channels  # 100
         print(initial_input_channels,"initial_input_channelsinitial_input_channelsinitial_input_channels")
     #     new_in_channels = initial_input_channels * 3 
         
@@ -896,12 +884,10 @@ def main(cfg: Config):
             if isinstance(unwrap_model(model), type(unwrap_model(transformer))):
                 model = unwrap_model(model)
                 if cfg.experiment.use_lora:
-                    # Save LoRA adapter only
                     lora_save_path = os.path.join(output_dir, "lora_adapter")
                     logger.info(f"Saving LoRA adapter to {lora_save_path}")
                     model.save_pretrained(lora_save_path)
                 else:
-                    # Save full model
                     model.save_pretrained(
                         os.path.join(output_dir, "transformer"), safe_serialization=True, max_shard_size="5GB"
                     )

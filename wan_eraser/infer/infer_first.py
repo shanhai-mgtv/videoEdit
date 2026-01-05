@@ -416,11 +416,11 @@ def main():
     # parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_image.png", help="Reference image path")
     # parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/out_2.mp4", help="Output video path")
     # parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/outputs/inpaint_lora_1222_change_the_refmask/inpaint_lora_v1/visualizations/vis_step_00000004/ref_masked_image.png", )
-    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0013/original.mp4", help="Input video path")
-    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0013/mask.png", help="Mask image path (single image)")
-    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0013/ref_image_aug.png", help="Reference image path")
-    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0013/out_0002_argmax_refnorm_again.mp4", help="Output video path")
-    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0013/ref_mask_aug.png", )
+    parser.add_argument("--video_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/original.mp4", help="Input video path")
+    parser.add_argument("--mask_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/mask.png", help="Mask image path (single image)")
+    parser.add_argument("--ref_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/ref_image_aug.png", help="Reference image path")
+    parser.add_argument("--output_path", type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/out_0002_argmax_refnorm_again.mp4", help="Output video path")
+    parser.add_argument("--ref_mask_path",type=str, default="/mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/wan_eraser/validation_demo/sample_0012/ref_mask_aug.png", )
     parser.add_argument("--prompt", type=str, default="A man is talking.", help="Prompt for generation")
     parser.add_argument(
         "--model_path",
