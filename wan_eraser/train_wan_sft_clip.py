@@ -33,6 +33,8 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils.torch_utils import is_compiled_module
 from moviepy import ImageSequenceClip
 
+from peft import LoraConfig, get_peft_model
+
 from config import Config  # isort:skip
 from optim import get_optimizer, max_gradient  # isort: skip
 from dataloading.dataset_clip import CLIPDataset
@@ -358,6 +360,33 @@ def main(cfg: Config):
             weight_dtype = torch.bfloat16
     logger.info(f"configured weight dtype: {weight_dtype!r}")
 
+    # ======================================================
+    # LoRA Setup (if enabled)
+    # ======================================================
+    if cfg.experiment.use_lora:
+        logger.info("Setting up LoRA fine-tuning...")
+        transformer.requires_grad_(False)  # Freeze base model first
+        
+        # Configure LoRA
+        lora_config = LoraConfig(
+            r=cfg.network.lora_rank,
+            lora_alpha=cfg.network.lora_alpha,
+            target_modules=cfg.network.target_modules or ["to_q", "to_k", "to_v", "to_out.0"],
+            lora_dropout=cfg.network.lora_dropout,
+            init_lora_weights=cfg.network.init_lora_weights,
+        )
+        
+        transformer = get_peft_model(transformer, lora_config)
+        logger.info(f"LoRA config: rank={cfg.network.lora_rank}, alpha={cfg.network.lora_alpha}")
+        transformer.print_trainable_parameters()
+        
+        # Load from existing LoRA checkpoint if specified
+        if cfg.checkpointing.resume_from_lora_checkpoint:
+            logger.info(f"Loading LoRA weights from {cfg.checkpointing.resume_from_lora_checkpoint}")
+            transformer.load_adapter(cfg.checkpointing.resume_from_lora_checkpoint, adapter_name="default")
+    else:
+        logger.info("Full fine-tuning mode (no LoRA)")
+
     if cfg.hparams.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
@@ -472,21 +501,38 @@ def main(cfg: Config):
         
         
         for model in models:
-            if isinstance(unwrap_model(model), type(unwrap_model(transformer))):
-                model = unwrap_model(model)
-                model.save_pretrained(
-                    os.path.join(output_dir, "transformer"), safe_serialization=True, max_shard_size="5GB"
-                )
+            model_unwrapped = unwrap_model(model)
+            # Check if it's transformer (handle both PeftModel and base model)
+            is_transformer = False
+            try:
+                if hasattr(model_unwrapped, 'base_model'):  # PeftModel
+                    is_transformer = True
+                elif isinstance(model_unwrapped, type(unwrap_model(transformer))):
+                    is_transformer = True
+            except:
+                pass
+            
+            if is_transformer:
+                if cfg.experiment.use_lora:
+                    # Save LoRA adapter only
+                    lora_save_path = os.path.join(output_dir, "lora_adapter")
+                    logger.info(f"Saving LoRA adapter to {lora_save_path}")
+                    model_unwrapped.save_pretrained(lora_save_path)
+                else:
+                    # Save full model
+                    model_unwrapped.save_pretrained(
+                        os.path.join(output_dir, "transformer"), safe_serialization=True, max_shard_size="5GB"
+                    )
+            elif isinstance(model_unwrapped, CLIPToTextProjection):
+                # Save clip_proj state dict
+                clip_proj_path = os.path.join(output_dir, "clip_proj.pt")
+                torch.save(model_unwrapped.state_dict(), clip_proj_path)
+                logger.info(f"Saved clip_proj to {clip_proj_path!r}")
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
             if weights:
                 weights.pop()
-        
-        # Save clip_proj state dict
-        clip_proj_path = os.path.join(output_dir, "clip_proj.pt")
-        torch.save(clip_proj.state_dict(), clip_proj_path)
-        logger.info(f"Saved clip_proj to {clip_proj_path!r}")
 
 
     def load_model_hook(models, input_dir):
@@ -498,36 +544,60 @@ def main(cfg: Config):
             except Exception as e:
                 logger.error(f"Could not load EMA model: {e!r}")
 
-        transformer_ = None
-        init_under_meta = False
-        if not accelerator.distributed_type == DistributedType.DEEPSPEED:
-            while len(models) > 0:
-                model = models.pop()
-                if isinstance(model, type(unwrap_model(transformer))):
-                    transformer_ = model
-                else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
+        # Handle LoRA loading
+        if cfg.experiment.use_lora:
+            lora_path = os.path.join(input_dir, "lora_adapter")
+            if os.path.exists(lora_path):
+                logger.info(f"Loading LoRA adapter from {lora_path}")
+                while len(models) > 0:
+                    model = models.pop()
+                    model_unwrapped = unwrap_model(model)
+                    if hasattr(model_unwrapped, 'load_adapter'):
+                        model_unwrapped.load_adapter(lora_path, adapter_name="default")
+                    elif isinstance(model_unwrapped, CLIPToTextProjection):
+                        pass  # Will load clip_proj below
+            else:
+                logger.warning(f"LoRA adapter not found at {lora_path}, skipping load")
+                while len(models) > 0:
+                    models.pop()
         else:
-            with init_empty_weights():
-                transformer_ = WanTransformer3DModel.from_pretrained(
-                    cfg.model.pretrained_model_transformer_name_or_path,
-                    subfolder="transformer"
+            # Full model loading
+            transformer_ = None
+            clip_proj_ = None
+            init_under_meta = False
+            
+            if not accelerator.distributed_type == DistributedType.DEEPSPEED:
+                while len(models) > 0:
+                    model = models.pop()
+                    model_unwrapped = unwrap_model(model)
+                    if isinstance(model_unwrapped, type(unwrap_model(transformer))):
+                        transformer_ = model
+                    elif isinstance(model_unwrapped, CLIPToTextProjection):
+                        clip_proj_ = model
+                    else:
+                        raise ValueError(f"unexpected load model: {model.__class__}")
+            else:
+                with init_empty_weights():
+                    transformer_ = WanTransformer3DModel.from_pretrained(
+                        cfg.model.pretrained_model_transformer_name_or_path,
+                        subfolder="transformer"
+                    )
+                    transformer_.to(accelerator.device, weight_dtype)
+                    init_under_meta = True
+
+            # Load transformer
+            if transformer_ is not None:
+                load_transformer_model = WanTransformer3DModel.from_pretrained(
+                    input_dir, subfolder="transformer"
                 )
-                transformer_.to(accelerator.device, weight_dtype)
-                init_under_meta = True
+                unwrap_model(transformer_).register_to_config(**load_transformer_model.config)
+                unwrap_model(transformer_).load_state_dict(load_transformer_model.state_dict(), assign=init_under_meta)
+                del load_transformer_model
 
+            if cfg.hparams.mixed_precision == "fp16":
+                cast_training_params([transformer_])
 
-        load_transformer_model = WanTransformer3DModel.from_pretrained(
-            input_dir, subfolder="transformer"
-        )
-        transformer_.register_to_config(**load_transformer_model.config)
-        transformer_.load_state_dict(load_transformer_model.state_dict(), assign=init_under_meta)
-        del load_transformer_model
-
-        if cfg.hparams.mixed_precision == "fp16":
-            cast_training_params([transformer_])
-
-        # Load clip_proj state dict
+        # Load clip_proj state dict (for both LoRA and full model)
         clip_proj_path = os.path.join(input_dir, "clip_proj.pt")
         if os.path.exists(clip_proj_path):
             clip_proj.load_state_dict(torch.load(clip_proj_path, map_location=accelerator.device))
@@ -581,7 +651,9 @@ def main(cfg: Config):
     
     # Prepare everything with our `accelerator`.
     
-    transformer, train_dataloader, optimizer, lr_scheduler = accelerator.prepare(transformer, train_dataloader, optimizer, lr_scheduler)
+    transformer, clip_proj, train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
+        transformer, clip_proj, train_dataloader, optimizer, lr_scheduler
+    )
 
 
     if cfg.hparams.ema.use_ema and ema_model is not None:

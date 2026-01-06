@@ -1,25 +1,18 @@
 """
-Video Inpainting Training Script with FIXED Reference Frame RoPE Position at 60
+S2V-Style Video Inpainting Training Script
 
-Key difference from train_wan_sft_second.py:
-- Reference frame RoPE position is FIXED at index 60 instead of sequential after masked video
-- Uses WanTransformer3DModelFixedRef and WanPipelineFixedRef
+Key features:
+- Model input on channel: noisy_latent(16) + masked_video(16) + mask(16) = 48 channels
+- Reference concatenated on temporal (d) dimension like S2V
+- Reference RoPE position fixed at 30
+- patch_embedding: 48 channels
 
-Inputs:
-    1. Original video (gt)
-    2. Masked video (mask==1 region blacked out)
-    3. Mask video (binary mask for all frames)
-    4. Mask image (first frame mask)
-    5. Reference image (first frame foreground cropped by bbox)
-
-Three-branch temporal fusion:
-    Branch 1: noisy_gt + masked_video + ref_img (temporal fusion)
-    Branch 2: zeros_gt + mask_video + mask_img (temporal fusion)  
-    Branch 3: zeros_gt + masked_video + ref_img (temporal fusion)
-
-Final: Channel-wise concatenation of all branches -> Transformer
-
-Based on train_wan_sft_second.py with fixed ref RoPE position at 60.
+Architecture:
+    model_input = concat([noisy_latent, masked_video_latent, mask_latent], dim=1)  # 48ch on channel
+    Transformer receives:
+        - hidden_states: [B, 48, F, H, W]
+        - ref_latents: [B, 16, 1, H, W] -> concatenated on sequence dimension inside transformer
+    Loss computed on denoised output (only video frames, not ref)
 """
 
 import logging
@@ -63,12 +56,11 @@ import re
 
 from config import Config
 from optim import get_optimizer, max_gradient
-from models.transformer_wan_rope import WanTransformer3DModelFixedRef
+from models.transformer_wan_s2v_style import WanTransformer3DModelS2VStyle
 from models.autoencoder_kl_wan import AutoencoderKLWan
 from models.flow_match import FlowMatchScheduler
-from pipelines.pipeline_wan_inpainting_fixed_ref import WanPipelineFixedRef, retrieve_latents, prompt_clean
+from pipelines.pipeline_wan_inpainting_s2v_style import WanPipelineS2VStyle, retrieve_latents, prompt_clean
 from ema import EMAModel
-# from utils_inference.video_writer import TensorSaveVideo
 
 
 logging.basicConfig(
@@ -86,7 +78,6 @@ if torch.cuda.is_available():
 
 logger = get_logger(__name__)
 
-# Norm layer prefixes for optional training
 NORM_LAYER_PREFIXES = ["norm_q", "norm_k", "norm_added_q", "norm_added_k"]
 
 
@@ -101,32 +92,6 @@ def save_video_with_numpy(video, path, fps):
     clip = ImageSequenceClip(frames, fps=fps)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     clip.write_videofile(path, codec="libx264", bitrate="10M")
-
-
-def read_video_cv2(video_path, mask=False):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        return np.array([]), 0
-
-    frames = []
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if mask:
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame_gray = (frame_gray > 5).astype(np.uint8) * 255
-            frame_gray = frame_gray[None, :, :]
-            frames.append(frame_gray)
-        else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame_rgb)
-
-    cap.release()
-    return np.array(frames), fps
 
 
 def bytes_to_gigabytes(x: int) -> float:
@@ -239,143 +204,41 @@ def get_t5_prompt_embeds(
     return prompt_embeds
 
 
-# ============================================================================
-# Three-Branch Fusion Functions
-# ============================================================================
-
-def create_ref_img_sequence(ref_img: torch.Tensor, num_frames: int) -> torch.Tensor:
-    """
-    Expand reference image to a sequence by repeating along temporal dimension.
-    
-    Args:
-        ref_img: [B, C, H, W] reference image
-        num_frames: number of frames to expand to
-        
-    Returns:
-        ref_seq: [B, C, F, H, W] reference sequence
-    """
-    # ref_img: [B, C, H, W] -> [B, C, 1, H, W] -> [B, C, F, H, W]
-    return ref_img.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
-
-
-def create_mask_img_sequence(mask_img: torch.Tensor, num_frames: int) -> torch.Tensor:
-    """
-    Expand mask image to a sequence by repeating along temporal dimension.
-    
-    Args:
-        mask_img: [B, 1, H, W] mask image
-        num_frames: number of frames to expand to
-        
-    Returns:
-        mask_seq: [B, 1, F, H, W] mask sequence
-    """
-    return mask_img.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
-
-
-def temporal_fusion_branch1(
-    noisy_latents: torch.Tensor,
-    masked_video_latents: torch.Tensor,
-    ref_latents: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Branch 1: noisy_gt + masked_video + ref_img (temporal fusion)
-    
-    Args:
-        noisy_latents: [B, C, F, H, W] noisy ground truth latents
-        masked_video_latents: [B, C, F, H, W] masked video latents
-        ref_latents: [B, C, F, H, W] reference image latents (expanded to sequence)
-        
-    Returns:
-        fused: [B, 3*C, F, H, W] temporally fused features
-    """
-    # Concatenate along channel dimension for temporal fusion
-    return torch.cat([noisy_latents, masked_video_latents, ref_latents], dim=1)
-
-
-def temporal_fusion_branch2(
-    zeros_latents: torch.Tensor,
-    mask_video: torch.Tensor,
-    mask_img_seq: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Branch 2: zeros_gt + mask_video + mask_img (temporal fusion)
-    
-    Args:
-        zeros_latents: [B, C, F, H, W] zero-filled latents (same shape as gt)
-        mask_video: [B, 1, F, H, W] mask video
-        mask_img_seq: [B, 1, F, H, W] mask image expanded to sequence
-        
-    Returns:
-        fused: [B, C+2, F, H, W] temporally fused features
-    """
-    return torch.cat([zeros_latents, mask_video, mask_img_seq], dim=1)
-
-
-def temporal_fusion_branch3(
-    zeros_latents: torch.Tensor,
-    masked_video_latents: torch.Tensor,
-    ref_latents: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Branch 3: zeros_gt + masked_video + ref_img (temporal fusion)
-    
-    Args:
-        zeros_latents: [B, C, F, H, W] zero-filled latents
-        masked_video_latents: [B, C, F, H, W] masked video latents
-        ref_latents: [B, C, F, H, W] reference image latents (expanded to sequence)
-        
-    Returns:
-        fused: [B, 3*C, F, H, W] temporally fused features
-    """
-    return torch.cat([zeros_latents, masked_video_latents, ref_latents], dim=1)
-
-
-def channel_fusion(
-    branch1_out: torch.Tensor,
-    branch2_out: torch.Tensor,
-    branch3_out: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Channel-wise fusion of all three branches.
-    
-    Args:
-        branch1_out: [B, C1, F, H, W] output from branch 1
-        branch2_out: [B, C2, F, H, W] output from branch 2
-        branch3_out: [B, C3, F, H, W] output from branch 3
-        
-    Returns:
-        fused: [B, C1+C2+C3, F, H, W] channel-fused features
-    """
-    return torch.cat([branch1_out, branch2_out, branch3_out], dim=1)
-
-
-def prepare_mask_latent_size(mask_values: torch.Tensor, nframes: int) -> torch.Tensor:
+def prepare_mask_latent_size(mask_values: torch.Tensor, nframes: int, num_channels: int = 4) -> torch.Tensor:
     """
     Prepare mask for latent space size.
     
     Args:
         mask_values: [B*F, 1, H, W] mask values
         nframes: number of frames
+        num_channels: number of output channels (default 4 for 100ch input: 48+48+4)
         
     Returns:
-        mask_video_latents: [B, 1, F//4, H//16, W//16] mask at latent size
+        mask_latents: [B, num_channels, F_lat, H_lat, W_lat] mask expanded to num_channels
     """
-    # Downsample to latent size
     latent_masks = rearrange(
         F.interpolate(mask_values, scale_factor=1/16, mode="nearest-exact"),
         "(b f) c h w -> b c f h w", f=nframes
     )
     
     # Handle temporal compression (4x)
+    # First frame is repeated 4 times, then rest of frames
     first_frame_mask = latent_masks[:, :, 0:1]
     first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=4)
-    mask_video_latents = torch.concat([first_frame_mask, latent_masks[:, :, 1:, :]], dim=2)
+    mask_latents = torch.concat([first_frame_mask, latent_masks[:, :, 1:, :]], dim=2)
     
-    batch_size, _, _, latent_height, latent_width = mask_video_latents.shape
-    mask_video_latents = mask_video_latents.view(batch_size, -1, 4, latent_height, latent_width)
-    mask_video_latents = mask_video_latents.transpose(1, 2)  # [B, C, F, H, W]
+    batch_size, _, _, latent_height, latent_width = mask_latents.shape
+    num_latent_frames = (nframes - 1) // 4 + 1
     
-    return mask_video_latents
+    # Reshape to get correct latent temporal dimension
+    mask_latents = mask_latents[:, :, :num_latent_frames*4, :, :]
+    mask_latents = mask_latents.view(batch_size, -1, num_latent_frames, 4, latent_height, latent_width)
+    mask_latents = mask_latents[:, :, :, 0, :, :]  # Take first of every 4
+    
+    # Expand to num_channels (4 for Wan2.2: 48+48+4=100)
+    mask_latents = mask_latents.repeat(1, num_channels, 1, 1, 1)
+    
+    return mask_latents
 
 
 # ============================================================================
@@ -404,7 +267,6 @@ def main(cfg: Config):
         project_config=accelerator_project_config,
         kwargs_handlers=[ddp_kwargs, init_kwargs],
     )
-    # tensor_writer = TensorSaveVideo()
 
     print(accelerator.state)
     accelerator.print("\nENVIRONMENT\n")
@@ -413,6 +275,7 @@ def main(cfg: Config):
     accelerator.print(f"  torch.version.cuda .............. {torch.version.cuda}")
     accelerator.print(f"  torch.backends.cudnn.version() .. {torch.backends.cudnn.version()}\n")
     accelerator.print(f">> Run ID : {cfg.experiment.run_id!r}")
+    accelerator.print(">> S2V-Style Training: 48ch input, ref on temporal dim, RoPE@30")
 
     if accelerator.is_main_process:
         transformers.utils.logging.set_verbosity_warning()
@@ -426,14 +289,6 @@ def main(cfg: Config):
         set_seed(seed_with_rank)
         logger.info(f"Set seed {seed_with_rank} for process {accelerator.process_index}")
 
-    if accelerator.num_processes > 1:
-        logger.info("DDP VARS: ")
-        logger.info(f"  WORLD_SIZE: {os.getenv('WORLD_SIZE', 'N/A')}")
-        logger.info(f"  LOCAL_WORLD_SIZE: {os.getenv('LOCAL_WORLD_SIZE', 'N/A')}")
-        logger.info(f"  RANK: {os.getenv('RANK', 'N/A')}")
-        logger.info(f"  MASTER_ADDR: {os.getenv('MASTER_ADDR', 'N/A')}")
-        logger.info(f"  MASTER_PORT: {os.getenv('MASTER_PORT', 'N/A')}")
-
     if accelerator.is_main_process:
         output_dirpath.mkdir(parents=True, exist_ok=True)
 
@@ -446,41 +301,6 @@ def main(cfg: Config):
     logger.info(f"config = \n{pyrallis.dump(cfg)}")
 
     # ======================================================
-    # Config validation
-    # ======================================================
-    def validate_config(cfg):
-        """Validate critical config items before training."""
-        errors = []
-        
-        # Data config validation
-        if not hasattr(cfg.data, 'nframes') or cfg.data.nframes is None:
-            errors.append("cfg.data.nframes is not set")
-        elif cfg.data.nframes <= 0:
-            errors.append(f"cfg.data.nframes must be positive, got {cfg.data.nframes}")
-        
-        if not hasattr(cfg.data, 'batch_size') or cfg.data.batch_size <= 0:
-            errors.append(f"cfg.data.batch_size must be positive")
-            
-        # Model config validation
-        if not hasattr(cfg.model, 'pretrained_model_name_or_path') or not cfg.model.pretrained_model_name_or_path:
-            errors.append("cfg.model.pretrained_model_name_or_path is not set")
-            
-        if not hasattr(cfg.model, 'pretrained_model_transformer_name_or_path') or not cfg.model.pretrained_model_transformer_name_or_path:
-            errors.append("cfg.model.pretrained_model_transformer_name_or_path is not set")
-        
-        # Training config validation
-        if not hasattr(cfg.hparams, 'max_train_steps') or cfg.hparams.max_train_steps is None:
-            if not hasattr(cfg.hparams, 'num_train_epochs') or cfg.hparams.num_train_epochs is None:
-                errors.append("Either max_train_steps or num_train_epochs must be set")
-        
-        if errors:
-            raise ValueError("Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
-        
-        logger.info("Config validation passed")
-    
-    validate_config(cfg)
-
-    # ======================================================
     # 2. build model
     # ======================================================
     noise_scheduler = FlowMatchScheduler(shift=7, sigma_min=0.0, extra_one_step=True)
@@ -491,30 +311,52 @@ def main(cfg: Config):
         cfg.model.pretrained_model_name_or_path,
         subfolder="vae",
         torch_dtype=load_dtype,
+        low_cpu_mem_usage=False,
     )
     text_encoder = UMT5EncoderModel.from_pretrained(
         cfg.model.pretrained_model_name_or_path,
         subfolder="text_encoder",
         torch_dtype=load_dtype,
+        low_cpu_mem_usage=False,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model.pretrained_model_name_or_path,
         subfolder="tokenizer",
     )
     
-    logger.info(f"Load transformer model from {cfg.model.pretrained_model_transformer_name_or_path!r}")
+    logger.info(f"Load base transformer from {cfg.model.pretrained_model_transformer_name_or_path!r}")
 
-    # Load transformer with fixed ref RoPE (position 60 for reference frames)
-    transformer = WanTransformer3DModelFixedRef.from_pretrained(
+    # Load base transformer and create S2V-style model
+    # patch_embedding: 100ch, ref_patch_embedding: 48ch
+    transformer = WanTransformer3DModelS2VStyle.from_pretrained(
         cfg.model.pretrained_model_transformer_name_or_path,
         subfolder="transformer",
         torch_dtype=load_dtype,
+        fixed_ref_position=30,
+        low_cpu_mem_usage=False, 
+        device_map=None,
     )
     
+    logger.info(f"Transformer config: in_channels={transformer.config.in_channels}, out_channels={transformer.config.out_channels}")
+    logger.info(f"Fixed ref RoPE position: {transformer.config.fixed_ref_position}")
+    logger.info("Initializing new layers: ref_patch_embedding, trainable_cond_mask...")
+    
     with torch.no_grad():
-        logger.info("Verifying transformer input channels for three-branch temporal+channel fusion")
-        initial_input_channels = transformer.config.in_channels
-        logger.info(f"Transformer initial input channels: {initial_input_channels}")
+        if transformer.patch_embedding.weight.shape == transformer.ref_patch_embedding.weight.shape:
+            transformer.ref_patch_embedding.weight.copy_(transformer.patch_embedding.weight)
+            if transformer.patch_embedding.bias is not None and transformer.ref_patch_embedding.bias is not None:
+                transformer.ref_patch_embedding.bias.copy_(transformer.patch_embedding.bias)
+            logger.info("Copied patch_embedding weights to ref_patch_embedding")
+        else:
+            # Use kaiming initialization if shapes don't match
+            nn.init.kaiming_normal_(transformer.ref_patch_embedding.weight, mode='fan_out', nonlinearity='linear')
+            if transformer.ref_patch_embedding.bias is not None:
+                nn.init.zeros_(transformer.ref_patch_embedding.bias)
+            logger.info(f"Kaiming initialized ref_patch_embedding (shape mismatch: {transformer.patch_embedding.weight.shape} vs {transformer.ref_patch_embedding.weight.shape})")
+        
+        # Initialize trainable_cond_mask embedding with small values
+        nn.init.normal_(transformer.trainable_cond_mask.weight, mean=0.0, std=0.02)
+        logger.info("Initialized trainable_cond_mask with normal distribution (std=0.02)")
 
     accelerator.wait_for_everyone()
 
@@ -548,9 +390,8 @@ def main(cfg: Config):
     # ======================================================
     if cfg.experiment.use_lora:
         logger.info("Setting up LoRA fine-tuning...")
-        transformer.requires_grad_(False)  # Freeze base model first
+        transformer.requires_grad_(False)
         
-        # Configure LoRA
         lora_config = LoraConfig(
             r=cfg.network.lora_rank,
             lora_alpha=cfg.network.lora_alpha,
@@ -561,9 +402,16 @@ def main(cfg: Config):
         
         transformer = get_peft_model(transformer, lora_config)
         logger.info(f"LoRA config: rank={cfg.network.lora_rank}, alpha={cfg.network.lora_alpha}")
+        
+        # Enable gradients for new layers (ref_patch_embedding, trainable_cond_mask)
+        # These are not LoRA layers, but need to be trained from scratch
+        for name, param in transformer.named_parameters():
+            if "ref_patch_embedding" in name or "trainable_cond_mask" in name:
+                param.requires_grad = True
+                logger.info(f"Enabled training for new layer: {name}")
+        
         transformer.print_trainable_parameters()
         
-        # Load from existing LoRA checkpoint if specified
         if cfg.checkpointing.resume_from_lora_checkpoint:
             logger.info(f"Loading LoRA weights from {cfg.checkpointing.resume_from_lora_checkpoint}")
             transformer.load_adapter(cfg.checkpointing.resume_from_lora_checkpoint, adapter_name="default")
@@ -624,31 +472,17 @@ def main(cfg: Config):
     # ======================================================
     # 3. build dataset and dataloaders
     # ======================================================
-    from dataloading.dataset_inpaint import InpaintingDataset, PreGeneratedInpaintingDataset
+    from dataloading.dataset_inpaint_s2v_style import InpaintingDatasetS2VStyle
     
-    # Enable debug saving for first few samples
     debug_save_dir = output_dirpath / "debug_data"
 
-    # Choose dataset based on config
-    use_pregenerated = getattr(cfg.data, 'use_pregenerated_data', False)
-    if use_pregenerated:
-        pregenerated_root = getattr(cfg.data, 'pregenerated_data_root', None)
-        logger.info(f"Using PreGeneratedInpaintingDataset with pregenerated_data_root={pregenerated_root}")
-        train_dataset = PreGeneratedInpaintingDataset(
-            cfg.data,
-            pregenerated_data_root=pregenerated_root,
-            save_debug=True,
-            debug_output_dir=str(debug_save_dir),
-            debug_save_prob=0.001,
-        )
-    else:
-        logger.info("Using InpaintingDataset with online mask generation")
-        train_dataset = InpaintingDataset(
-            cfg.data,
-            save_debug=True,
-            debug_output_dir=str(debug_save_dir),
-            debug_save_prob=0.001,  # Save ~0.1% of samples for debugging
-        )
+    logger.info("Using S2V-style InpaintingDataset (no ref augmentation, maximize mask region)")
+    train_dataset = InpaintingDatasetS2VStyle(
+        cfg.data,
+        save_debug=True,
+        debug_output_dir=str(debug_save_dir),
+        debug_save_prob=0.001,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -679,44 +513,32 @@ def main(cfg: Config):
             except Exception as e:
                 logger.error(f"Error saving EMA model: {e!r}")
 
-            logger.info("Saving EMA model to disk.")
-            trainable_parameters = [p for p in primary_model.parameters() if p.requires_grad]
-            ema_model.store(trainable_parameters)
-            ema_model.copy_to(trainable_parameters)
-            # Save EMA LoRA weights
-            transformer_lora_layers = get_peft_model_state_dict(primary_model)
-            WanPipelineFixedRef.save_lora_weights(
-                os.path.join(output_dir, "ema"),
-                transformer_lora_layers=transformer_lora_layers,
-                weight_name=f"{cfg.experiment.run_id}.safetensors",
-            )
-            ema_model.restore(trainable_parameters)
-
         transformer_lora_layers_to_save = None
         for model in models:
             if isinstance(unwrap_model(model), type(unwrap_model(transformer))):
                 model = unwrap_model(model)
                 if cfg.experiment.use_lora:
                     transformer_lora_layers_to_save = get_peft_model_state_dict(model)
-                    
-                    # Include norm layers if trained
-                    if hasattr(cfg.network, 'train_norm_layers') and cfg.network.train_norm_layers:
-                        transformer_norm_layers_to_save = {
-                            f"transformer.{name}": param
-                            for name, param in model.named_parameters()
-                            if any(k in name for k in NORM_LAYER_PREFIXES)
-                        }
-                        transformer_lora_layers_to_save = {
-                            **transformer_lora_layers_to_save,
-                            **transformer_norm_layers_to_save,
-                        }
-                    
-                    WanPipelineFixedRef.save_lora_weights(
+                    WanPipelineS2VStyle.save_lora_weights(
                         output_dir,
                         transformer_lora_layers=transformer_lora_layers_to_save,
                         weight_name=f"{cfg.experiment.run_id}.safetensors",
                     )
                     logger.info(f"Saved LoRA weights to {output_dir}")
+                    
+                    # Save new layers (ref_patch_embedding, trainable_cond_mask) separately
+                    # These are full layers, not LoRA, so save them as a separate file
+                    from safetensors.torch import save_file
+                    new_layers_state_dict = {
+                        "ref_patch_embedding.weight": model.ref_patch_embedding.weight.data.clone(),
+                        "trainable_cond_mask.weight": model.trainable_cond_mask.weight.data.clone(),
+                    }
+                    if model.ref_patch_embedding.bias is not None:
+                        new_layers_state_dict["ref_patch_embedding.bias"] = model.ref_patch_embedding.bias.data.clone()
+                    
+                    new_layers_path = os.path.join(output_dir, "s2v_new_layers.safetensors")
+                    save_file(new_layers_state_dict, new_layers_path)
+                    logger.info(f"Saved new layers (ref_patch_embedding, trainable_cond_mask) to {new_layers_path}")
                 else:
                     model.save_pretrained(
                         os.path.join(output_dir, "transformer"), safe_serialization=True, max_shard_size="5GB"
@@ -736,8 +558,8 @@ def main(cfg: Config):
                 logger.error(f"Could not load EMA model: {e!r}")
 
         if cfg.experiment.use_lora:
-            # Load from single safetensors file saved by save_model_hook
             lora_weights_path = os.path.join(input_dir, f"{cfg.experiment.run_id}.safetensors")
+            new_layers_path = os.path.join(input_dir, "s2v_new_layers.safetensors")
             
             if os.path.exists(lora_weights_path):
                 logger.info(f"Loading LoRA weights from {lora_weights_path}")
@@ -746,35 +568,39 @@ def main(cfg: Config):
                 while len(models) > 0:
                     model = models.pop()
                     set_peft_model_state_dict(model, lora_state_dict)
+                    
+                    # Load new layers (ref_patch_embedding, trainable_cond_mask)
+                    if os.path.exists(new_layers_path):
+                        logger.info(f"Loading new layers from {new_layers_path}")
+                        new_layers_dict = load_file(new_layers_path)
+                        unwrapped = unwrap_model(model)
+                        if "ref_patch_embedding.weight" in new_layers_dict:
+                            unwrapped.ref_patch_embedding.weight.data.copy_(new_layers_dict["ref_patch_embedding.weight"])
+                        if "ref_patch_embedding.bias" in new_layers_dict:
+                            unwrapped.ref_patch_embedding.bias.data.copy_(new_layers_dict["ref_patch_embedding.bias"])
+                        if "trainable_cond_mask.weight" in new_layers_dict:
+                            unwrapped.trainable_cond_mask.weight.data.copy_(new_layers_dict["trainable_cond_mask.weight"])
+                        logger.info("Loaded new layers (ref_patch_embedding, trainable_cond_mask)")
+                    else:
+                        logger.warning(f"New layers file not found at {new_layers_path}")
             else:
                 logger.warning(f"LoRA weights not found at {lora_weights_path}, skipping load")
                 while len(models) > 0:
                     models.pop()
         else:
-            # Full model loading
             transformer_ = None
-            init_under_meta = False
-            if not accelerator.distributed_type == DistributedType.DEEPSPEED:
-                while len(models) > 0:
-                    model = models.pop()
-                    if isinstance(model, type(unwrap_model(transformer))):
-                        transformer_ = model
-                    else:
-                        raise ValueError(f"unexpected save model: {model.__class__}")
-            else:
-                with init_empty_weights():
-                    transformer_ = WanTransformer3DModelFixedRef.from_pretrained(
-                        cfg.model.pretrained_model_name_or_path,
-                        subfolder="transformer"
-                    )
-                    transformer_.to(accelerator.device, weight_dtype)
-                    init_under_meta = True
+            while len(models) > 0:
+                model = models.pop()
+                if isinstance(model, type(unwrap_model(transformer))):
+                    transformer_ = model
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
 
-            load_transformer_model = WanTransformer3DModelFixedRef.from_pretrained(
+            load_transformer_model = WanTransformer3DModelS2VStyle.from_pretrained(
                 input_dir, subfolder="transformer"
             )
             transformer_.register_to_config(**load_transformer_model.config)
-            transformer_.load_state_dict(load_transformer_model.state_dict(), assign=init_under_meta)
+            transformer_.load_state_dict(load_transformer_model.state_dict())
             del load_transformer_model
 
         logger.info(f"Completed loading checkpoint from Path: {input_dir!r}")
@@ -830,12 +656,6 @@ def main(cfg: Config):
             (accelerator.device if cfg.hparams.ema.ema_device == "accelerator" else "cpu"),
             dtype=weight_dtype
         )
-        if cfg.hparams.ema.ema_device == "cpu" and not cfg.hparams.ema.ema_cpu_only:
-            logger.info("Pinning EMA model weights to CPU...")
-            try:
-                ema_model.pin_memory()
-            except Exception as e:
-                logger.error(f"Failed to pin EMA model to CPU: {e}")
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / cfg.hparams.gradient_accumulation_steps)
     if cfg.hparams.max_train_steps is None:
@@ -846,7 +666,7 @@ def main(cfg: Config):
     total_batch_size = cfg.data.batch_size * accelerator.num_processes * cfg.hparams.gradient_accumulation_steps
     num_trainable_parameters = sum(p.numel() for p in transformer_parameters)
 
-    logger.info("***** Running training *****")
+    logger.info("***** Running S2V-style training *****")
     logger.info(f"  Num trainable parameters ........................................... {num_trainable_parameters}")
     logger.info(f"  Num examples ....................................................... {len(train_dataset)}")
     logger.info(f"  Num batches each epoch ............................................. {len(train_dataloader)}")
@@ -901,107 +721,17 @@ def main(cfg: Config):
 
     generator = torch.Generator(device=accelerator.device)
     if cfg.experiment.random_seed is not None:
-        # Use rank-offset seed for generator as well
         generator = generator.manual_seed(cfg.experiment.random_seed + accelerator.process_index)
-    
-    # Track visualization steps to avoid re-saving on resume
-    visualization_steps_saved = set()
-    if initial_global_step > 0:
-        # Mark steps before resume point as already saved
-        visualization_steps_saved = set(range(min(5, initial_global_step)))
-
-    # ============================================
-    # Visualization helper function
-    # ============================================
-    def save_training_visualization(batch, global_step, save_dir):
-        """Save batch data for visualization to verify data pipeline."""
-        import cv2
-        from pathlib import Path
-        from moviepy import ImageSequenceClip
-        
-        vis_dir = Path(save_dir) / f"vis_step_{global_step:08d}"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Get first sample from batch
-        target = batch["target_images"][0].cpu().numpy()  # [F, C, H, W]
-        masked = batch["masked_video"][0].cpu().numpy()   # [F, C, H, W]
-        mask_v = batch["mask_video"][0].cpu().numpy()     # [F, 1, H, W]
-        ref = batch["ref_image"][0].cpu().numpy()         # [C, H, W]
-        mask_i = batch["mask_image"][0].cpu().numpy()     # [1, H, W]
-        ref_masked_i = batch["ref_masked_image"][0].cpu().numpy()  # [1, H, W]
-        caption = batch["caption"][0] if isinstance(batch["caption"], list) else batch["caption"]
-        
-        # Denormalize images: [-1,1] -> [0,255]
-        def denorm(x):
-            return ((x + 1) * 127.5).clip(0, 255).astype(np.uint8)
-        
-        # ==================== Save Videos ====================
-        # Save target video
-        target_frames = [denorm(target[i].transpose(1, 2, 0)) for i in range(target.shape[0])]
-        clip = ImageSequenceClip(target_frames, fps=16)
-        clip.write_videofile(str(vis_dir / "target_video.mp4"), codec="libx264", logger=None)
-        
-        # Save masked video
-        masked_frames = [denorm(masked[i].transpose(1, 2, 0)) for i in range(masked.shape[0])]
-        clip = ImageSequenceClip(masked_frames, fps=16)
-        clip.write_videofile(str(vis_dir / "masked_video.mp4"), codec="libx264", logger=None)
-        
-        # Save mask video (grayscale to RGB for video)
-        mask_frames = [(mask_v[i, 0] * 255).clip(0, 255).astype(np.uint8) for i in range(mask_v.shape[0])]
-        mask_frames_rgb = [cv2.cvtColor(f, cv2.COLOR_GRAY2RGB) for f in mask_frames]
-        clip = ImageSequenceClip(mask_frames_rgb, fps=16)
-        clip.write_videofile(str(vis_dir / "mask_video.mp4"), codec="libx264", logger=None)
-        
-        # ==================== Save First Frames ====================
-        cv2.imwrite(str(vis_dir / "target_frame0.png"), cv2.cvtColor(target_frames[0], cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(vis_dir / "masked_frame0.png"), cv2.cvtColor(masked_frames[0], cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(vis_dir / "mask_frame0.png"), mask_frames[0])
-        
-        # ==================== Save Images ====================
-        # Save ref image
-        ref_img = denorm(ref.transpose(1, 2, 0))
-        cv2.imwrite(str(vis_dir / "ref_image.png"), cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR))
-        
-        # Save mask image (first frame mask)
-        mask_img_vis = (mask_i[0] * 255).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(str(vis_dir / "mask_image.png"), mask_img_vis)
-        
-        # Save ref_masked_image (reference mask)
-        ref_masked_img_vis = (ref_masked_i[0] * 255).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(str(vis_dir / "ref_masked_image.png"), ref_masked_img_vis)
-        
-        # ==================== Save Caption ====================
-        with open(vis_dir / "caption.txt", "w") as f:
-            f.write(str(caption))
-        
-        # ==================== Save Shapes Info ====================
-        with open(vis_dir / "shapes.txt", "w") as f:
-            f.write(f"target_images: {batch['target_images'].shape}\n")
-            f.write(f"masked_video: {batch['masked_video'].shape}\n")
-            f.write(f"mask_video: {batch['mask_video'].shape}\n")
-            f.write(f"ref_image: {batch['ref_image'].shape}\n")
-            f.write(f"mask_image: {batch['mask_image'].shape}\n")
-            f.write(f"ref_masked_image: {batch['ref_masked_image'].shape}\n")
-            f.write(f"caption: {caption}\n")
-        
-        logger.info(f"Saved visualization (videos + images) to {vis_dir}")
 
     for epoch in range(first_epoch, cfg.hparams.num_train_epochs):
         logger.info(f"epoch {epoch+1}/{cfg.hparams.num_train_epochs}")
         transformer.train()
 
         for step, batch in enumerate(train_dataloader):
-            # ============================================
-            # Save visualization for first few steps (skip if already saved on resume)
-            # ============================================
-            if accelerator.is_main_process and global_step < 5 and global_step not in visualization_steps_saved:
-                save_training_visualization(batch, global_step, output_dirpath / "visualizations")
-                visualization_steps_saved.add(global_step)
-            
             models_to_accumulate = [transformer]
             with accelerator.accumulate(models_to_accumulate):
                 # ============================================
-                # Prepare inputs
+                # Prepare inputs (S2V-style)
                 # ============================================
                 # Ground truth video: [B, F, C, H, W] -> [B, C, F, H, W]
                 video = rearrange(batch["target_images"], "b f c h w -> b c f h w").to(dtype=weight_dtype)
@@ -1012,11 +742,8 @@ def main(cfg: Config):
                 # Mask video: [B, F, 1, H, W] -> [B*F, 1, H, W]
                 mask_video = rearrange(batch["mask_video"], "b f c h w -> (b f) c h w").to(dtype=weight_dtype)
                 
-                # Reference image (first frame foreground): [B, C, H, W]
+                # Reference image (NO augmentation): [B, C, H, W]
                 ref_img = batch["ref_image"].to(dtype=weight_dtype)
-                
-                # Mask image (first frame mask): [B, 1, H, W]
-                mask_img = batch["ref_masked_image"].to(dtype=weight_dtype)
                 
                 # Caption
                 prompt = batch["caption"]
@@ -1025,29 +752,28 @@ def main(cfg: Config):
                 # Encode to latent space
                 # ============================================
                 with torch.no_grad():
+                    # Encode GT video
                     latents = prepare_latents(vae, video, device=accelerator.device, dtype=weight_dtype)
+                    
+                    # Encode masked video
                     masked_video_latents = prepare_latents(vae, masked_video, device=accelerator.device, dtype=weight_dtype)
                     
-                    # Encode reference image (expand to video format first)
-                    # ref_img: [B, C, H, W] -> [B, C, 1, H, W]
+                    # Encode reference image: [B, C, H, W] -> [B, C, 1, H, W] -> encode -> [B, 16, 1, H_lat, W_lat]
                     ref_img_video = ref_img.unsqueeze(2)
                     ref_latents = prepare_latents(vae, ref_img_video, device=accelerator.device, dtype=weight_dtype)
 
-                    # Prepare mask video at latent size
-                    mask_lat_size = prepare_mask_latent_size(mask_video, cfg.data.nframes) # 4通道 -> [B 4 f h w]
-                    num_latent_frames = mask_lat_size.shape[2]
+                    # Prepare mask at latent size: [B, 16, F_lat, H_lat, W_lat]
+                    mask_latents = prepare_mask_latent_size(mask_video, cfg.data.nframes)
+                    mask_latents = mask_latents.to(dtype=weight_dtype, device=accelerator.device)
                     
-                    # ref_mask 尺度 -> [B, 4, 1, h, w], mask_video -> [B, 4, F, h, w]
-                    # ref_latents 尺度 -> [B, 16, 1, h, w]
-                    mask_img_lat_size = F.interpolate(mask_img, scale_factor=1/16, mode="nearest-exact")  # [B, 1, h, w]
-                    mask_img_lat_size = mask_img_lat_size.unsqueeze(2).repeat(1, 4, 1, 1, 1)  # [B, 4, 1, h, w]
-                    
+                    # Get text embeddings
                     prompt_embeds = get_t5_prompt_embeds(
                         text_encoder, tokenizer, prompt,
                         device=latents.device, dtype=weight_dtype
                     )
 
                 batch_size = latents.size(0)
+                num_latent_frames = latents.shape[2]
 
                 # ============================================
                 # Add noise to ground truth
@@ -1055,93 +781,49 @@ def main(cfg: Config):
                 noise = torch.randn(latents.shape, device=accelerator.device, dtype=weight_dtype, generator=generator)
                 timestep_id = torch.randint(0, noise_scheduler.num_train_timesteps, (1,))
                 timestep = noise_scheduler.timesteps[timestep_id].to(dtype=weight_dtype, device=accelerator.device)
-                noisy_model_input = noise_scheduler.add_noise(latents, noise, timestep)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timestep)
                 training_target = noise_scheduler.training_target(latents, noise, timestep)
-                
-                zeros_latents = torch.zeros_like(latents)  # [B, 48, F, h, w]
-                zeros_latents_4ch = torch.zeros_like(mask_lat_size)  # [B, 4, F, h, w]
 
                 # ============================================
-                # Three-branch temporal fusion + channel fusion
-                # 100-channel structure (48 + 4 + 48 = 100)
+                # Build 100-channel model input (Wan2.2 S2V style)
+                # model_input = concat([noisy_latent(48), masked_video(48), mask(4)], dim=1)
                 # ============================================
+                # Concat on channel dim: noisy(48) + masked_video(48) + mask(4) = 100 channels
+                model_input = torch.cat([noisy_latents, masked_video_latents, mask_latents], dim=1)
                 
-                # Runtime shape validation before concatenation
-                expected_temporal_frames = num_latent_frames * 2 + ref_latents.shape[2]  # 2F + 1
-                assert noisy_model_input.shape[2] == num_latent_frames, \
-                    f"noisy_model_input temporal dim mismatch: {noisy_model_input.shape[2]} vs {num_latent_frames}"
-                assert masked_video_latents.shape[2] == num_latent_frames, \
-                    f"masked_video_latents temporal dim mismatch: {masked_video_latents.shape[2]} vs {num_latent_frames}"
-                assert mask_lat_size.shape[2] == num_latent_frames, \
-                    f"mask_lat_size temporal dim mismatch: {mask_lat_size.shape[2]} vs {num_latent_frames}"
-                assert ref_latents.shape[2] == 1, \
-                    f"ref_latents should have 1 frame, got {ref_latents.shape[2]}"
-                assert mask_img_lat_size.shape[2] == 1, \
-                    f"mask_img_lat_size should have 1 frame, got {mask_img_lat_size.shape[2]}"
-                
-                # Verify spatial dimensions match
-                H_lat, W_lat = latents.shape[3], latents.shape[4]
-                assert ref_latents.shape[3:] == (H_lat, W_lat), \
-                    f"ref_latents spatial dim mismatch: {ref_latents.shape[3:]} vs ({H_lat}, {W_lat})"
-                
-                branch1 = torch.cat([noisy_model_input, masked_video_latents, ref_latents], dim=2)  # [B, 16, 2F+1, h, w]
-                branch2 = torch.cat([zeros_latents_4ch, mask_lat_size, mask_img_lat_size], dim=2)   # [B, 4, 2F+1, h, w]
-                branch3 = torch.cat([zeros_latents, masked_video_latents, ref_latents], dim=2)      # [B, 16, 2F+1, h, w]
-                model_input = torch.cat([branch1, branch2, branch3], dim=1)
-
-                # Release intermediate tensors to free memory
-                del branch1, branch2, branch3, zeros_latents, zeros_latents_4ch
-
-                # Debug shape verification (first step only)
                 if step == 0 and accelerator.is_main_process:
-                    logger.info(f"Model input shape: {model_input.shape}")
-                    logger.info(f"Expected: [B, 36, {expected_temporal_frames}, H, W]")
+                    logger.info(f"S2V-style model input shape: {model_input.shape} (expected [B, 100, F, H, W])")
+                    logger.info(f"Reference latents shape: {ref_latents.shape} (expected [B, 48, 1, H, W])")
 
-                num_latent_frames = latents.shape[2]
-                ref_num_frames = ref_latents.shape[2]
-                frame_segments = [
-                    (num_latent_frames, False),   # noisy_gt: sequential indices 0 to F-1
-                    (num_latent_frames, False),   # masked_video: sequential indices F to 2F-1
-                    (ref_num_frames, True),       # ref_img: FIXED position 60
-                ]
-
-                denoised_latents_full = transformer(
+                # ============================================
+                # Forward pass (ref concatenated on d inside transformer)
+                # ============================================
+                denoised_latents = transformer(
                     hidden_states=model_input,
+                    ref_latents=ref_latents,
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
                     attention_kwargs=None,
-                    frame_segments=frame_segments,
                     return_dict=False,
                 )[0]
                 
-                # Extract only the first F frames (corresponding to noisy_gt prediction)
-                # denoised_latents_full: [B, 16, 3F, H, W] -> denoised_latents: [B, 16, F, H, W]
-                num_latent_frames = latents.shape[2]  # F
-                denoised_latents = denoised_latents_full[:, :, :num_latent_frames, :, :]
-                
                 if step == 0 and accelerator.is_main_process:
-                    logger.info(f"Transformer output shape: {denoised_latents_full.shape}")
-                    logger.info(f"Extracted denoised_latents shape: {denoised_latents.shape}")
+                    logger.info(f"Transformer output shape: {denoised_latents.shape}")
                     logger.info(f"Training target shape: {training_target.shape}")
 
                 # ============================================
                 # Compute loss
                 # ============================================
                 weighting = noise_scheduler.training_weight(timestep)
-                weight_mask = mask_lat_size[:, 0:1]  # [B, 1, F, H, W]
-                
-                # Release large intermediate tensors before loss computation
-                del denoised_latents_full, model_input
+                weight_mask = mask_latents[:, 0:1]  # [B, 1, F, H, W]
                 
                 # Weighted MSE loss with mask emphasis
                 loss = torch.mean(
                     (weighting * (denoised_latents.float() - training_target.float()) ** 2 * (1 + weight_mask.float())).reshape(training_target.shape[0], -1),
                     1,
                 )
+                loss = loss.mean()
                 assert torch.isnan(loss).sum() == 0, "NaN loss detected"
-                
-                # Release more intermediate tensors
-                del denoised_latents, training_target, noisy_model_input
 
                 accelerator.backward(loss)
                 
@@ -1205,10 +887,9 @@ def main(cfg: Config):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             
-            # Memory cleanup - ALL processes clear cache for distributed training
             if global_step % 100 == 0:
                 torch.cuda.empty_cache()
-                gc.collect()  # Also trigger Python garbage collection
+                gc.collect()
 
             if global_step >= cfg.hparams.max_train_steps:
                 logger.info(f"max training steps={cfg.hparams.max_train_steps!r} reached.")
@@ -1225,22 +906,8 @@ def main(cfg: Config):
         transformer = unwrap_model(transformer)
         
         if cfg.experiment.use_lora:
-            # Save final LoRA weights using get_peft_model_state_dict
             transformer_lora_layers = get_peft_model_state_dict(transformer)
-            
-            # Include norm layers if trained
-            if hasattr(cfg.network, 'train_norm_layers') and cfg.network.train_norm_layers:
-                transformer_norm_layers = {
-                    f"transformer.{name}": param
-                    for name, param in transformer.named_parameters()
-                    if any(k in name for k in NORM_LAYER_PREFIXES)
-                }
-                transformer_lora_layers = {
-                    **transformer_lora_layers,
-                    **transformer_norm_layers,
-                }
-            
-            WanPipelineFixedRef.save_lora_weights(
+            WanPipelineS2VStyle.save_lora_weights(
                 output_dirpath,
                 transformer_lora_layers=transformer_lora_layers,
                 safe_serialization=True,

@@ -1,0 +1,89 @@
+
+experiment:
+  output_dirpath: outputs/inpaint_s2v_style
+  run_id: inpaint_s2v_v1
+  random_seed: 42
+  use_lora: true
+
+model:
+  pretrained_model_name_or_path: /mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/base
+  pretrained_model_transformer_name_or_path: /mnt/shanhai-ai/shanhai-workspace/lihaoran/ckps/wanErase/checkpoint-step00105000
+
+network:
+  lora_rank: 128
+  lora_alpha: 128
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - patch_embedding
+    - ref_patch_embedding
+    - trainable_cond_mask
+  lora_dropout: 0.05
+  init_lora_weights: true
+  train_norm_layers: false
+  lora_layers: "all-linear"
+
+data:
+  csv_file_list:
+    - /mnt/shanhai-ai/shanhai-workspace/lihaoran/project/code/videoEdit/videoEdit/data/wanErase_data/train_data_filtered.csv
+  data_root: /
+  nframes: 81
+  batch_size: 1
+  dataloader_kwargs:
+    drop_last: true
+    num_workers: 1
+    persistent_workers: false  
+    pin_memory: false  
+    prefetch_factor: 1
+
+hparams:
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-05
+  optimizer_type: "optimi-stableadamw"
+  optimizer_args:
+    - "weight_decay=1e-2"
+    - "eps=1e-8"
+    - "betas=(0.9, 0.95)"
+  max_grad_norm: 1.0
+  grad_clip_method: "norm"
+  lr_scheduler: "constant_with_warmup"
+  lr_warmup_steps: 100
+  lr_scheduler_num_cycles: 1
+  lr_scheduler_power: 0.9
+  guidance_scale: 1.0
+  num_train_epochs: 10
+  max_train_steps: null
+  caption_dropout_p: 0.0
+  gradient_precision: "accelerator"
+  fsdp_sharding_startegy: "full"
+  use_cpu_offload: false
+  flow_match:
+    discrete_flow_shift: 7.0
+    timestep_sampling: "logit_normal"
+    weighting_scheme: "none"
+    sigmoid_scale: 1.0
+    logit_mean: 0.0
+    logit_std: 1.0
+  ema:
+    use_ema: false
+    ema_decay: 0.99
+    ema_foreach_disable: false
+    ema_device: "accelerator"
+    ema_cpu_only: false
+    ema_update_interval: null
+
+checkpointing:
+  save_every_n_steps: 100
+  save_last_n_steps: 1000000000
+  resume_from_checkpoint: 
+  resume_from_lora_checkpoint: null 
+
+ddp_kwargs:
+  backend: "nccl"
+  find_unused_parameters: true
+  gradient_as_bucket_view: false
+  static_graph: false
